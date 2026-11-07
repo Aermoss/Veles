@@ -1,0 +1,221 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "std/arena", "std/opt", "src/Logger.zir", "src/Source.zir",
+    "src/Lexer.zir", "src/Parser.zir", "src/Checker.zir", "src/Emitter.zir" : *]
+
+fn PrintVersion(executable: String) {
+    WriteLine("Veles 0.1.0 (" + executable + ")");
+    WriteLine("Copyright (c) 2026 Yusuf Rençber.");
+    WriteLine("Licensed under the Apache License, Version 2.0.");
+    WriteLine("See the LICENSE file for details.");
+}
+
+fn PrintUsage(executable: String) {
+    WriteLine("OVERVIEW: Veles hardware description language compiler");
+    WriteLine("USAGE: " + executable + " [options] <input.vel>");
+    WriteLine("OPTIONS:");
+    WriteLine("  -o <file>                Write SystemVerilog output to <file>");
+    WriteLine("  -I<dir>                  Add <dir> to the include search path");
+    WriteLine("  -fsyntax-only            Check the input without writing output");
+    WriteLine("  --contents <file>        Read the input's text from <file> (used by editors)");
+    WriteLine("  --version                Display compiler version");
+    WriteLine("  -h, --help               Display this help message");
+}
+
+class Driver {
+    arena: *mut Arena = null,
+    pub include_dirs: Vector<String>,
+    pub files: Vector<*mut ASTFile>,
+    loaded: Vector<String>,
+    override_key: String,
+    override_path: String;
+
+    Driver(&mut this, arena: *mut Arena) {
+        this.arena = arena;
+    }
+
+    fn Key(&this, path: &String) -> String {
+        let absolute = match AbsolutePath(path) {
+            Result<String, IOError>::Ok(absolute) => absolute,
+            Result<String, IOError>::Err(_) => String(path)
+        };
+
+        absolute.Replace("/", "\\").ToLower()
+    }
+
+    pub fn Override(&mut this, path: &String, contents: &String) {
+        (this.override_key, this.override_path) = (this.Key(path), contents);
+    }
+
+    fn Resolve(&this, include: &String, directory: &String) -> Option<String> {
+        let local = JoinPath(directory, include);
+        if FileExists(local) { return Option<String>::Some(local); }
+
+        for dir in this.include_dirs {
+            let candidate = JoinPath(dir, include);
+            if FileExists(candidate) { return Option<String>::Some(candidate); }
+        }
+
+        Option<String>::None
+    }
+
+    pub fn Load(&mut this, path: &String) -> bool {
+        let key = this.Key(path);
+        if this.loaded.Contains(key) { return true; }
+        this.loaded.PushBack(key);
+
+        let source = if !this.override_path.Empty() && key == this.override_key { this.override_path } else { String(path) };
+
+        let text = match File::ReadText(source) {
+            Result<String, IOError>::Ok(text) => text,
+            Result<String, IOError>::Err(error) => {
+                Logger::Log("Failed to read file '" + source + "': " + error.ToString() + ".", LogSeverity::Error);
+                return false;
+            }
+        };
+
+        let id = Sources()->Add(path, text);
+        let mut lexer = Lexer(id);
+        let mut parser = Parser(&mut lexer, this.arena);
+        let file = parser.Parse(path);
+        this.files.PushBack(file);
+        let (directory, _) = SplitPath(path);
+        let mut success = true;
+
+        for i in 0..file->includes.Length() {
+            let include = file->includes[i];
+
+            match this.Resolve(include, directory) {
+                Option<String>::Some(resolved) => {
+                    if !this.Load(resolved) { success = false; }
+                },
+                Option<String>::None => {
+                    Logger::Log("Cannot find included file '" + include + "'.", file->include_spans[i], LogSeverity::Error);
+                    success = false;
+                }
+            }
+        }
+
+        success
+    }
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    let (_, executable) = SplitPath(args[0]);
+    let mut logger = Logger(executable);
+
+    if args.Length() < 2 {
+        PrintUsage(executable);
+        return 1;
+    }
+
+    let mut input: String;
+    let mut output: String;
+    let mut contents: String;
+    let mut syntax_only = false;
+    let mut include_dirs = Vector<String>();
+    let mut i: usize = 1;
+
+    while i < args.Length() {
+        let arg = args[i];
+
+        if arg == "--help" || arg == "-h" {
+            PrintUsage(executable);
+            return 0;
+        } else if arg == "--version" {
+            PrintVersion(executable);
+            return 0;
+        } else if arg == "-fsyntax-only" || arg == "-check" {
+            syntax_only = true;
+        } else if arg == "--contents" {
+            i += 1;
+
+            if i < args.Length() {
+                contents = args[i];
+            } else {
+                Logger::Log("Missing argument to '--contents'.", LogSeverity::Error);
+                return 1;
+            }
+        } else if arg == "-o" {
+            i += 1;
+
+            if i < args.Length() {
+                output = args[i];
+            } else {
+                Logger::Log("Missing argument to '-o'.", LogSeverity::Error);
+                return 1;
+            }
+        } else if arg.StartsWith("-I") {
+            if arg.Length() > 2 {
+                include_dirs.PushBack(arg.SubString(2));
+            } else {
+                i += 1;
+
+                if i < args.Length() {
+                    include_dirs.PushBack(args[i]);
+                } else {
+                    Logger::Log("Missing argument to '-I'.", LogSeverity::Error);
+                    return 1;
+                }
+            }
+        } else if arg.StartsWith("-") {
+            Logger::Log("Unknown option '" + arg + "'.", LogSeverity::Error);
+            return 1;
+        } else if !input.Empty() {
+            Logger::Log("Already specified an input file.", LogSeverity::Error);
+            return 1;
+        } else if !FileExists(arg) {
+            Logger::Log("Cannot find '" + arg + "'.", LogSeverity::Error);
+            return 1;
+        } else {
+            input = arg;
+        }
+
+        i += 1;
+    }
+
+    if input.Empty() {
+        Logger::Log("No input file.", LogSeverity::Error);
+        return 1;
+    }
+
+    let mut arena = Arena();
+    let mut driver = Driver(&mut arena);
+    driver.include_dirs = include_dirs;
+    if !contents.Empty() { driver.Override(input, contents); }
+    driver.Load(input);
+    if Logger::HasError() { return 1; }
+
+    let mut checker = Checker();
+    checker.Check(driver.files);
+    if Logger::HasError() { return 1; }
+    if syntax_only { return 0; }
+
+    let mut emitter = Emitter(&mut checker);
+    let text = emitter.Emit(SplitPath(input).1);
+
+    if output.Empty() {
+        output = SplitExtension(input).0 + ".sv";
+    }
+
+    if let Result<(), IOError>::Err(error) = File::WriteText(output, text) {
+        Logger::Log("Failed to write file '" + output + "': " + error.ToString() + ".", LogSeverity::Error);
+        return 1;
+    }
+
+    0
+}

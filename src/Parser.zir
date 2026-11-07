@@ -1,0 +1,925 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "std/arena", "std/opt", "src/Logger.zir", "src/Lexer.zir", "src/AST.zir" : *]
+
+const PRECEDENCE_COMPARISON: i32 = 3;
+const PRECEDENCE_BITWISE_XOR: i32 = 5;
+const PRECEDENCE_SHIFT: i32 = 7;
+
+class Parser {
+    arena: *mut Arena = null,
+    lexer: *mut Lexer = null,
+    buffer: Vector<Token>,
+    previous: SourceSpan;
+
+    Parser(&mut this, lexer: *mut Lexer, arena: *mut Arena) {
+        (this.lexer, this.arena) = (lexer, arena);
+        this.previous = SourceSpan { file: 0, start: 0, end: 0 };
+    }
+
+    fn New<T>(&mut this, args...) -> *mut T {
+        let node = this.arena->New<T>(args...);
+        this.Finish(node);
+        node
+    }
+
+    fn Finish(&this, node: *mut ASTNode) {
+        if node != null && node->span.file == this.previous.file && this.previous.end > node->span.end {
+            node->span.end = this.previous.end;
+        }
+    }
+
+    fn Fill(&mut this, count: usize) {
+        while this.buffer.Length() < count {
+            this.buffer.PushBack(this.lexer->Next());
+        }
+    }
+
+    fn Current(&mut this) -> Token {
+        this.Fill(1);
+        this.buffer[0]
+    }
+
+    fn Peek(&mut this, offset: usize) -> Token {
+        this.Fill(offset + 1);
+        this.buffer[offset]
+    }
+
+    fn Advance(&mut this) -> Token {
+        let token = this.Current();
+
+        if token._type != TokenType::EndOfFile {
+            this.buffer.RemoveAt(0);
+        }
+
+        this.previous = token.span;
+        token
+    }
+
+    fn Check(&mut this, _type: TokenType) -> bool {
+        this.Current()._type == _type
+    }
+
+    fn Match(&mut this, _type: TokenType) -> bool {
+        if this.Check(_type) {
+            this.Advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ExpectedAt(&this, token: &Token) -> SourceSpan {
+        if token._type == TokenType::EndOfFile {
+            return SourceSpan { file: this.previous.file, start: this.previous.end, end: this.previous.end };
+        }
+
+        token.span
+    }
+
+    fn Error(&mut this, message: &String) {
+        let token = this.Current();
+        Logger::Log(message, this.ExpectedAt(token), LogSeverity::Error);
+    }
+
+    fn Expect(&mut this, _type: TokenType) -> bool {
+        let token = this.Current();
+
+        if token._type == _type {
+            this.Advance();
+            return true;
+        }
+
+        Logger::Log("Expected " + _type.Describe() + ", found " + token.Describe() + ".", this.ExpectedAt(token), LogSeverity::Error);
+        false
+    }
+
+    fn ExpectIdentifier(&mut this) -> Option<String> {
+        let token = this.Current();
+
+        if token._type == TokenType::Identifier {
+            this.Advance();
+            return Option<String>::Some(token.Text());
+        }
+
+        Logger::Log("Expected an identifier, found " + token.Describe() + ".", this.ExpectedAt(token), LogSeverity::Error);
+        Option<String>::None
+    }
+
+    fn IsWildcard(&mut this) -> bool {
+        let token = this.Current();
+        token._type == TokenType::Identifier && token.Text() == "_"
+    }
+
+    fn Synchronize(&mut this) {
+        let mut depth = 0;
+
+        loop {
+            let _type = this.Current()._type;
+
+            if _type == TokenType::EndOfFile { return; }
+
+            if depth == 0 {
+                if _type == TokenType::Semicolon {
+                    this.Advance();
+                    return;
+                }
+
+                if _type == TokenType::RightBrace { return; }
+
+                if _type == TokenType::Module || _type == TokenType::Extern || _type == TokenType::Enum || _type == TokenType::Const ||
+                    _type == TokenType::Type || _type == TokenType::Let || _type == TokenType::Wire || _type == TokenType::Reg ||
+                    _type == TokenType::Seq || _type == TokenType::Comb {
+                    return;
+                }
+            }
+
+            if _type == TokenType::LeftBrace {
+                depth += 1;
+            } else if _type == TokenType::RightBrace {
+                depth -= 1;
+
+                if depth == 0 {
+                    this.Advance();
+                    return;
+                }
+            }
+
+            this.Advance();
+        }
+    }
+
+    fn Recover(&mut this, before: u32) {
+        if this.Current().span.start == before && !this.Check(TokenType::EndOfFile) {
+            this.Advance();
+        }
+
+        this.Synchronize();
+    }
+
+    fn ParseType(&mut this) -> *mut ASTType {
+        let token = this.Current();
+
+        if token._type == TokenType::LeftBracket {
+            this.Advance();
+            let element = this.ParseType();
+            if element == null || !this.Expect(TokenType::Semicolon) { return null; }
+            let length = this.ParseExpression();
+            if length == null || !this.Expect(TokenType::RightBracket) { return null; }
+            return this.New<ASTArrayType>(element, length, token.span);
+        }
+
+        if token._type != TokenType::Identifier {
+            Logger::Log("Expected a type, found " + token.Describe() + ".", this.ExpectedAt(token), LogSeverity::Error);
+            return null;
+        }
+
+        this.Advance();
+        let name = token.Text();
+
+        if (name == "u" || name == "i") && this.Check(TokenType::Less) {
+            this.Advance();
+            let width = this.ParseBinary(PRECEDENCE_SHIFT);
+            if width == null || !this.Expect(TokenType::Greater) { return null; }
+            return this.New<ASTSizedType>(name == "i", width, token.span);
+        }
+
+        this.New<ASTNamedType>(name, token.span)
+    }
+
+    fn BinaryPrecedence(&this, _type: TokenType) -> i32 {
+        match _type {
+            TokenType::Or => 1,
+            TokenType::And => 2,
+            TokenType::Equal | TokenType::NotEqual | TokenType::Less | TokenType::Greater | TokenType::LessEqual | TokenType::GreaterEqual => PRECEDENCE_COMPARISON,
+            TokenType::BitwiseOr => 4,
+            TokenType::BitwiseXor => PRECEDENCE_BITWISE_XOR,
+            TokenType::BitwiseAnd => 6,
+            TokenType::LeftShift | TokenType::RightShift => PRECEDENCE_SHIFT,
+            TokenType::Plus | TokenType::Minus => 8,
+            TokenType::Mul | TokenType::Div | TokenType::Mod => 9,
+            _ => -1
+        }
+    }
+
+    fn BinaryKind(&this, _type: TokenType) -> ASTBinaryKind {
+        match _type {
+            TokenType::Plus => ASTBinaryKind::Add,
+            TokenType::Minus => ASTBinaryKind::Subtract,
+            TokenType::Mul => ASTBinaryKind::Multiply,
+            TokenType::Div => ASTBinaryKind::Divide,
+            TokenType::Mod => ASTBinaryKind::Modulo,
+            TokenType::BitwiseAnd => ASTBinaryKind::BitwiseAnd,
+            TokenType::BitwiseOr => ASTBinaryKind::BitwiseOr,
+            TokenType::BitwiseXor => ASTBinaryKind::BitwiseXor,
+            TokenType::LeftShift => ASTBinaryKind::LeftShift,
+            TokenType::RightShift => ASTBinaryKind::RightShift,
+            TokenType::Equal => ASTBinaryKind::Equal,
+            TokenType::NotEqual => ASTBinaryKind::NotEqual,
+            TokenType::Less => ASTBinaryKind::Less,
+            TokenType::Greater => ASTBinaryKind::Greater,
+            TokenType::LessEqual => ASTBinaryKind::LessEqual,
+            TokenType::GreaterEqual => ASTBinaryKind::GreaterEqual,
+            TokenType::And => ASTBinaryKind::And,
+            _ => ASTBinaryKind::Or
+        }
+    }
+
+    fn ParseInteger(&mut this, token: &Token) -> *mut ASTExpression {
+        let text = token.Text().Replace("_", "");
+        let mut radix: u32 = 10;
+        let mut digits = text;
+
+        if text.StartsWith("0x") || text.StartsWith("0X") {
+            (radix, digits) = (16, text.SubString(2));
+        } else if text.StartsWith("0b") || text.StartsWith("0B") {
+            (radix, digits) = (2, text.SubString(2));
+        } else if text.StartsWith("0o") || text.StartsWith("0O") {
+            (radix, digits) = (8, text.SubString(2));
+        }
+
+        let mut valid = !digits.Empty();
+
+        for i in 0..digits.Length() {
+            let character = digits[i];
+
+            let digit: u32 = if character >= '0' && character <= '9' { (character - '0') as u32 }
+                else if character >= 'a' && character <= 'f' { (character - 'a') as u32 + 10 }
+                else if character >= 'A' && character <= 'F' { (character - 'A') as u32 + 10 }
+                else { 99 };
+
+            if digit >= radix { valid = false; }
+        }
+
+        if !valid {
+            Logger::Log("Invalid integer literal '" + token.Text() + "'.", token.span, LogSeverity::Error);
+            return null;
+        }
+
+        match digits.ToUnsignedInteger(radix as HostUnsigned) {
+            Option<HostUnsigned>::Some(value) => {
+                if value > 0x7FFFFFFFFFFFFFFF {
+                    Logger::Log("Integer literal '" + token.Text() + "' is too large; constants are limited to 63 bits for now.", token.span, LogSeverity::Error);
+                    return null;
+                }
+
+                this.New<ASTIntegerLiteral>(value as i64, radix, token.span)
+            },
+            Option<HostUnsigned>::None => {
+                Logger::Log("Invalid integer literal '" + token.Text() + "'.", token.span, LogSeverity::Error);
+                null
+            }
+        }
+    }
+
+    fn ParsePath(&mut this, first: &Token) -> *mut ASTPathExpression {
+        let path = this.New<ASTPathExpression>(first.span);
+        path->segments.PushBack(first.Text());
+
+        while this.Check(TokenType::DoubleColon) {
+            this.Advance();
+
+            match this.ExpectIdentifier() {
+                Option<String>::Some(name) => path->segments.PushBack(name),
+                Option<String>::None => { return null; }
+            }
+        }
+
+        this.Finish(path);
+        path
+    }
+
+    fn ParseInstance(&mut this, path: *mut ASTPathExpression) -> *mut ASTExpression {
+        if path->segments.Length() != 1 {
+            Logger::Log("Expected a module name.", path->span, LogSeverity::Error);
+            return null;
+        }
+
+        let instance = this.New<ASTInstanceExpression>(path->segments[0], path->span);
+        this.Expect(TokenType::LeftBrace);
+
+        while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
+            let token = this.Current();
+            let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+            let mut value: *mut ASTExpression = null;
+
+            if this.Match(TokenType::Colon) {
+                value = this.ParseExpression();
+                if value == null { return null; }
+            } else {
+                let shorthand = this.New<ASTPathExpression>(token.span);
+                shorthand->segments.PushBack(name);
+                value = shorthand;
+            }
+
+            instance->connections.PushBack(this.arena->New<ASTConnection>(name, value, token.span));
+            if !this.Match(TokenType::Comma) { break; }
+        }
+
+        if !this.Expect(TokenType::RightBrace) { return null; }
+        this.Finish(instance);
+        instance
+    }
+
+    fn ParseIfExpression(&mut this) -> *mut ASTExpression {
+        let token = this.Advance();
+        let condition = this.ParseExpression();
+        if condition == null || !this.Expect(TokenType::LeftBrace) { return null; }
+        let then = this.ParseExpression();
+        if then == null || !this.Expect(TokenType::RightBrace) { return null; }
+
+        if !this.Check(TokenType::Else) {
+            Logger::Log("An 'if' expression needs an 'else' branch.", this.ExpectedAt(this.Current()), LogSeverity::Error);
+            return null;
+        }
+
+        this.Advance();
+        let mut otherwise: *mut ASTExpression = null;
+
+        if this.Check(TokenType::If) {
+            otherwise = this.ParseIfExpression();
+        } else {
+            if !this.Expect(TokenType::LeftBrace) { return null; }
+            otherwise = this.ParseExpression();
+            if otherwise == null || !this.Expect(TokenType::RightBrace) { return null; }
+        }
+
+        if otherwise == null { return null; }
+        this.New<ASTIfExpression>(condition, then, otherwise, token.span)
+    }
+
+    fn ParsePrimary(&mut this, allow_instance: bool) -> *mut ASTExpression {
+        let token = this.Current();
+
+        match token._type {
+            TokenType::Integer => {
+                this.Advance();
+                this.ParseInteger(token)
+            },
+            TokenType::True | TokenType::False => {
+                this.Advance();
+                this.New<ASTBooleanLiteral>(token._type == TokenType::True, token.span)
+            },
+            TokenType::Identifier => {
+                this.Advance();
+
+                if this.Check(TokenType::LeftParen) {
+                    this.Advance();
+                    let call = this.New<ASTCallExpression>(token.Text(), token.span);
+
+                    while !this.Check(TokenType::RightParen) && !this.Check(TokenType::EndOfFile) {
+                        let argument = this.ParseExpression();
+                        if argument == null { return null; }
+                        call->arguments.PushBack(argument);
+                        if !this.Match(TokenType::Comma) { break; }
+                    }
+
+                    if !this.Expect(TokenType::RightParen) { return null; }
+                    this.Finish(call);
+                    return call;
+                }
+
+                let path = this.ParsePath(token);
+                if path == null { return null; }
+
+                if allow_instance && this.Check(TokenType::LeftBrace) {
+                    return this.ParseInstance(path);
+                }
+
+                path
+            },
+            TokenType::LeftParen => {
+                this.Advance();
+                let expression = this.ParseExpression();
+                if expression == null || !this.Expect(TokenType::RightParen) { return null; }
+                expression
+            },
+            TokenType::If => this.ParseIfExpression(),
+            _ => {
+                Logger::Log("Expected an expression, found " + token.Describe() + ".", this.ExpectedAt(token), LogSeverity::Error);
+                null
+            }
+        }
+    }
+
+    fn ParsePostfix(&mut this, allow_instance: bool) -> *mut ASTExpression {
+        let mut expression = this.ParsePrimary(allow_instance);
+        if expression == null { return null; }
+
+        loop {
+            if this.Check(TokenType::LeftBracket) {
+                this.Advance();
+                let index = this.ParseExpression();
+                if index == null { return null; }
+
+                if this.Match(TokenType::Colon) {
+                    let low = this.ParseExpression();
+                    if low == null || !this.Expect(TokenType::RightBracket) { return null; }
+                    expression = this.New<ASTSliceExpression>(expression, index, low, expression->span);
+                } else {
+                    if !this.Expect(TokenType::RightBracket) { return null; }
+                    expression = this.New<ASTIndexExpression>(expression, index, expression->span);
+                }
+            } else if this.Check(TokenType::Dot) {
+                this.Advance();
+
+                match this.ExpectIdentifier() {
+                    Option<String>::Some(name) => {
+                        expression = this.New<ASTMemberExpression>(expression, name, expression->span);
+                    },
+                    Option<String>::None => { return null; }
+                }
+            } else {
+                break;
+            }
+        }
+
+        expression
+    }
+
+    fn ParseUnary(&mut this, allow_instance: bool) -> *mut ASTExpression {
+        let token = this.Current();
+
+        if token._type == TokenType::Not || token._type == TokenType::Minus {
+            this.Advance();
+            let operand = this.ParseUnary(false);
+            if operand == null { return null; }
+            let op = if token._type == TokenType::Not { ASTUnaryKind::Not } else { ASTUnaryKind::Negate };
+            return this.New<ASTUnaryExpression>(op, operand, token.span);
+        }
+
+        this.ParsePostfix(allow_instance)
+    }
+
+    fn ParseCast(&mut this, allow_instance: bool) -> *mut ASTExpression {
+        let mut expression = this.ParseUnary(allow_instance);
+        if expression == null { return null; }
+
+        while this.Check(TokenType::As) {
+            this.Advance();
+            let target = this.ParseType();
+            if target == null { return null; }
+            expression = this.New<ASTCastExpression>(expression, target, expression->span);
+        }
+
+        expression
+    }
+
+    fn ParseBinaryWith(&mut this, min_precedence: i32, allow_instance: bool) -> *mut ASTExpression {
+        let mut left = this.ParseCast(allow_instance);
+        if left == null { return null; }
+
+        loop {
+            let token = this.Current();
+            let precedence = this.BinaryPrecedence(token._type);
+            if precedence < 0 || precedence < min_precedence { break; }
+            this.Advance();
+
+            let right = this.ParseBinaryWith(precedence + 1, false);
+            if right == null { return null; }
+            left = this.New<ASTBinaryExpression>(this.BinaryKind(token._type), left, right, left->span);
+        }
+
+        left
+    }
+
+    fn ParseBinary(&mut this, min_precedence: i32) -> *mut ASTExpression {
+        this.ParseBinaryWith(min_precedence, false)
+    }
+
+    fn ParseExpression(&mut this) -> *mut ASTExpression {
+        this.ParseBinaryWith(0, false)
+    }
+
+    fn ParseBlock(&mut this) -> *mut ASTBlockStatement {
+        let token = this.Current();
+        if !this.Expect(TokenType::LeftBrace) { return null; }
+        let block = this.New<ASTBlockStatement>(token.span);
+
+        while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
+            if this.Match(TokenType::Semicolon) { continue; }
+            let before = this.Current().span.start;
+            let statement = this.ParseStatement();
+
+            if statement == null {
+                this.Recover(before);
+                continue;
+            }
+
+            block->statements.PushBack(statement);
+        }
+
+        if !this.Expect(TokenType::RightBrace) { return null; }
+        this.Finish(block);
+        block
+    }
+
+    fn ParseAssignment(&mut this, terminated: bool) -> *mut ASTStatement {
+        let token = this.Current();
+        let target = this.ParseExpression();
+        if target == null { return null; }
+        let assign_token = this.Current();
+        let nonblocking = assign_token._type == TokenType::NonBlocking;
+
+        if assign_token._type != TokenType::Assign && !nonblocking {
+            if target->kind == ASTExpressionKind::Binary && (target as *mut ASTBinaryExpression)->op == ASTBinaryKind::LessEqual {
+                Logger::Log("Expected an assignment; non-blocking assignments use '<-' in Veles, '<=' is a comparison.", target->span, LogSeverity::Error);
+            } else {
+                Logger::Log("Expected '=' or '<-', found " + assign_token.Describe() + ".", this.ExpectedAt(assign_token), LogSeverity::Error);
+            }
+
+            return null;
+        }
+
+        this.Advance();
+        let value = this.ParseExpression();
+        if value == null { return null; }
+        if terminated && !this.Expect(TokenType::Semicolon) { return null; }
+        this.New<ASTAssignStatement>(target, value, nonblocking, token.span)
+    }
+
+    fn ParseIf(&mut this) -> *mut ASTStatement {
+        let token = this.Advance();
+        let condition = this.ParseExpression();
+        if condition == null { return null; }
+        let then = this.ParseBlock();
+        if then == null { return null; }
+        let mut otherwise: *mut ASTStatement = null;
+
+        if this.Match(TokenType::Else) {
+            otherwise = if this.Check(TokenType::If) { this.ParseIf() } else { this.ParseBlock() as *mut ASTStatement };
+            if otherwise == null { return null; }
+        }
+
+        this.New<ASTIfStatement>(condition, then, otherwise, token.span)
+    }
+
+    fn ParseMatch(&mut this) -> *mut ASTStatement {
+        let token = this.Advance();
+        let scrutinee = this.ParseExpression();
+        if scrutinee == null || !this.Expect(TokenType::LeftBrace) { return null; }
+        let statement = this.New<ASTMatchStatement>(scrutinee, token.span);
+
+        while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
+            let arm = this.arena->New<ASTMatchArm>(this.Current().span);
+
+            loop {
+                if this.IsWildcard() {
+                    this.Advance();
+                    arm->wildcard = true;
+                } else {
+                    let pattern = this.ParseBinary(PRECEDENCE_BITWISE_XOR);
+                    if pattern == null { return null; }
+                    arm->patterns.PushBack(pattern);
+                }
+
+                if !this.Match(TokenType::BitwiseOr) { break; }
+            }
+
+            if !this.Expect(TokenType::FatArrow) { return null; }
+
+            if this.Check(TokenType::LeftBrace) {
+                arm->body = this.ParseBlock();
+                if arm->body == null { return null; }
+                this.Match(TokenType::Comma);
+            } else {
+                arm->body = this.ParseAssignment(false);
+                if arm->body == null { return null; }
+
+                if !this.Match(TokenType::Comma) && !this.Match(TokenType::Semicolon) && !this.Check(TokenType::RightBrace) {
+                    this.Error("Expected ',' after match arm, found " + this.Current().Describe() + ".");
+                    return null;
+                }
+            }
+
+            statement->arms.PushBack(arm);
+        }
+
+        if !this.Expect(TokenType::RightBrace) { return null; }
+        this.Finish(statement);
+        statement
+    }
+
+    fn ParseStatement(&mut this) -> *mut ASTStatement {
+        match this.Current()._type {
+            TokenType::LeftBrace => this.ParseBlock(),
+            TokenType::If => this.ParseIf(),
+            TokenType::Match => this.ParseMatch(),
+            TokenType::Let | TokenType::Wire | TokenType::Reg => {
+                this.Error("Signals must be declared at module level, not inside a block.".ToString());
+                null
+            },
+            _ => this.ParseAssignment(true)
+        }
+    }
+
+    fn ParseInclude(&mut this, file: *mut ASTFile) -> bool {
+        this.Advance();
+        let directive = this.Current();
+
+        if directive._type != TokenType::Identifier || directive.Text() != "include" {
+            this.Error("Expected 'include' after '#[', found " + directive.Describe() + ".");
+            return false;
+        }
+
+        this.Advance();
+
+        loop {
+            let token = this.Current();
+            if !this.Expect(TokenType::String) { return false; }
+            file->includes.PushBack(this.lexer->Unescape(token.span));
+            file->include_spans.PushBack(token.span);
+            if !this.Match(TokenType::Comma) { break; }
+        }
+
+        if this.Match(TokenType::Colon) {
+            this.Expect(TokenType::Mul);
+        }
+
+        this.Expect(TokenType::RightBracket)
+    }
+
+    fn ParseConst(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        let mut declared: *mut ASTType = null;
+
+        if this.Match(TokenType::Colon) {
+            declared = this.ParseType();
+            if declared == null { return null; }
+        }
+
+        if !this.Expect(TokenType::Assign) { return null; }
+        let value = this.ParseExpression();
+        if value == null || !this.Expect(TokenType::Semicolon) { return null; }
+        this.New<ASTConstItem>(name, declared, value, token.span)
+    }
+
+    fn ParseTypeAlias(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        if !this.Expect(TokenType::Assign) { return null; }
+        let aliased = this.ParseType();
+        if aliased == null || !this.Expect(TokenType::Semicolon) { return null; }
+        this.New<ASTTypeItem>(name, aliased, token.span)
+    }
+
+    fn ParseEnum(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        let mut base: *mut ASTType = null;
+
+        if this.Match(TokenType::Colon) {
+            base = this.ParseType();
+            if base == null { return null; }
+        }
+
+        if !this.Expect(TokenType::LeftBrace) { return null; }
+        let item = this.New<ASTEnumItem>(name, base, token.span);
+
+        while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
+            let variant = this.Current();
+            let variant_name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+            let mut value: *mut ASTExpression = null;
+
+            if this.Match(TokenType::Assign) {
+                value = this.ParseExpression();
+                if value == null { return null; }
+            }
+
+            item->variants.PushBack(this.arena->New<ASTVariant>(variant_name, value, variant.span));
+            if !this.Match(TokenType::Comma) { break; }
+        }
+
+        if !this.Expect(TokenType::RightBrace) { return null; }
+        this.Finish(item);
+        item
+    }
+
+    fn ParsePort(&mut this) -> *mut ASTPort {
+        let token = this.Current();
+        let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        if !this.Expect(TokenType::Colon) { return null; }
+        let direction = this.Current();
+        let input = direction._type == TokenType::In;
+
+        if !input && direction._type != TokenType::Out {
+            this.Error("Expected 'in' or 'out', found " + direction.Describe() + ".");
+            return null;
+        }
+
+        this.Advance();
+        let registered = !input && this.Match(TokenType::Reg);
+        let declared = this.ParseType();
+        if declared == null { return null; }
+        let mut init: *mut ASTExpression = null;
+
+        if this.Match(TokenType::Assign) {
+            init = this.ParseExpression();
+            if init == null { return null; }
+        }
+
+        this.New<ASTPort>(name, input, registered, declared, init, token.span)
+    }
+
+    fn ParseModule(&mut this) -> *mut ASTItem {
+        let token = this.Current();
+        let external = this.Match(TokenType::Extern);
+        if !this.Expect(TokenType::Module) { return null; }
+        let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        let module = this.New<ASTModuleItem>(name, external, token.span);
+        if !this.Expect(TokenType::LeftParen) { return null; }
+
+        while !this.Check(TokenType::RightParen) && !this.Check(TokenType::EndOfFile) {
+            let port = this.ParsePort();
+            if port == null { return null; }
+            module->ports.PushBack(port);
+            if !this.Match(TokenType::Comma) { break; }
+        }
+
+        if !this.Expect(TokenType::RightParen) { return null; }
+
+        if external {
+            if !this.Expect(TokenType::Semicolon) { return null; }
+            this.Finish(module);
+            return module;
+        }
+
+        if !this.Expect(TokenType::LeftBrace) { return null; }
+
+        while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
+            if this.Match(TokenType::Semicolon) { continue; }
+            let before = this.Current().span.start;
+            let item = this.ParseModuleItem();
+
+            if item == null {
+                this.Recover(before);
+                continue;
+            }
+
+            module->items.PushBack(item);
+        }
+
+        if !this.Expect(TokenType::RightBrace) { return null; }
+        this.Finish(module);
+        module
+    }
+
+    fn ParseSignal(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let signal = match token._type { TokenType::Let => ASTSignalKind::Let, TokenType::Wire => ASTSignalKind::Wire, _ => ASTSignalKind::Reg };
+        let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        let mut declared: *mut ASTType = null;
+        let mut value: *mut ASTExpression = null;
+
+        if this.Match(TokenType::Colon) {
+            declared = this.ParseType();
+            if declared == null { return null; }
+        } else if signal != ASTSignalKind::Let {
+            this.Error("Expected ':' and a type after '" + name + "'.");
+            return null;
+        }
+
+        if signal == ASTSignalKind::Wire {
+            if this.Check(TokenType::Assign) {
+                this.Error("A 'wire' is driven separately; use 'let' to declare and assign at once.".ToString());
+                return null;
+            }
+        } else if signal == ASTSignalKind::Let {
+            if !this.Expect(TokenType::Assign) { return null; }
+            value = this.ParseBinaryWith(0, true);
+            if value == null { return null; }
+        } else if this.Match(TokenType::Assign) {
+            value = this.ParseExpression();
+            if value == null { return null; }
+        }
+
+        if !this.Expect(TokenType::Semicolon) { return null; }
+        this.New<ASTSignalItem>(signal, name, declared, value, token.span)
+    }
+
+    fn ParseSeq(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let mut clock: *mut ASTExpression = null;
+        let mut reset: *mut ASTExpression = null;
+
+        if this.Match(TokenType::LeftParen) {
+            clock = this.ParseExpression();
+            if clock == null { return null; }
+
+            if this.Match(TokenType::Comma) {
+                reset = this.ParseExpression();
+                if reset == null { return null; }
+            }
+
+            if !this.Expect(TokenType::RightParen) { return null; }
+        }
+
+        let body = this.ParseBlock();
+        if body == null { return null; }
+        this.New<ASTSeqItem>(clock, reset, body, token.span)
+    }
+
+    fn ParseModuleItem(&mut this) -> *mut ASTItem {
+        let token = this.Current();
+
+        match token._type {
+            TokenType::Const => this.ParseConst(),
+            TokenType::Type => this.ParseTypeAlias(),
+            TokenType::Enum => this.ParseEnum(),
+            TokenType::Let | TokenType::Wire | TokenType::Reg => this.ParseSignal(),
+            TokenType::Seq => this.ParseSeq(),
+            TokenType::Comb => {
+                this.Advance();
+                let body = this.ParseBlock();
+                if body == null { return null; }
+                this.New<ASTCombItem>(body, token.span)
+            },
+            TokenType::Module | TokenType::Extern => {
+                this.Error("Modules cannot be nested.".ToString());
+                null
+            },
+            TokenType::If | TokenType::Match => {
+                this.Error("'" + token.Text() + "' is only allowed inside 'comb' and 'seq' blocks.");
+                null
+            },
+            _ => {
+                let target = this.ParseExpression();
+                if target == null { return null; }
+                let assign_token = this.Current();
+
+                if assign_token._type == TokenType::NonBlocking {
+                    Logger::Log("Non-blocking assignments are only allowed inside 'seq' blocks.", assign_token.span, LogSeverity::Error);
+                    return null;
+                }
+
+                if assign_token._type != TokenType::Assign && target->kind == ASTExpressionKind::Binary && (target as *mut ASTBinaryExpression)->op == ASTBinaryKind::LessEqual {
+                    Logger::Log("Expected an assignment; use '=' for continuous assignments, '<=' is a comparison.", target->span, LogSeverity::Error);
+                    return null;
+                }
+
+                if !this.Expect(TokenType::Assign) { return null; }
+                let value = this.ParseExpression();
+                if value == null || !this.Expect(TokenType::Semicolon) { return null; }
+                this.New<ASTAssignItem>(target, value, token.span)
+            }
+        }
+    }
+
+    fn ParseTopItem(&mut this) -> *mut ASTItem {
+        let token = this.Current();
+
+        match token._type {
+            TokenType::Const => this.ParseConst(),
+            TokenType::Type => this.ParseTypeAlias(),
+            TokenType::Enum => this.ParseEnum(),
+            TokenType::Module | TokenType::Extern => this.ParseModule(),
+            TokenType::Let | TokenType::Wire | TokenType::Reg | TokenType::Seq | TokenType::Comb => {
+                this.Error("'" + token.Text() + "' is only allowed inside a module.");
+                null
+            },
+            _ => {
+                this.Error("Expected an item, found " + token.Describe() + ".");
+                null
+            }
+        }
+    }
+
+    pub fn Parse(&mut this, path: &String) -> *mut ASTFile {
+        let file = this.arena->New<ASTFile>(path);
+
+        while !this.Check(TokenType::EndOfFile) {
+            if this.Check(TokenType::PreprocessorStart) {
+                let before = this.Current().span.start;
+                if !this.ParseInclude(file) { this.Recover(before); }
+                continue;
+            }
+
+            let before = this.Current().span.start;
+            let item = this.ParseTopItem();
+
+            if item == null {
+                this.Recover(before);
+                continue;
+            }
+
+            file->items.PushBack(item);
+        }
+
+        file
+    }
+}

@@ -1,0 +1,531 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "std/map", "src/AST.zir", "src/Semantic.zir", "src/Checker.zir" : *]
+
+fn Pad(level: usize) -> String {
+    ' ' * (level * 4)
+}
+
+fn IsSystemVerilogKeyword(name: &String) -> bool {
+    let keywords = "always always_comb always_ff always_latch and assert assign automatic begin bit buf byte case casex casez ".ToString() +
+        "class const continue default defparam disable do edge else end endcase endclass endfunction endgenerate " +
+        "endinterface endmodule endpackage endprimitive endprogram endtask enum event export extern final for force " +
+        "foreach forever fork function generate genvar if iff import initial inout input inside int integer interface " +
+        "join local localparam logic longint macromodule module nand negedge new nor not null or output package packed " +
+        "parameter posedge primitive priority program real reg release repeat return shortint signed static string " +
+        "struct super supply0 supply1 table task this time tri typedef union unique unsigned var void wait wand while " +
+        "wire wor xnor xor";
+
+    for keyword in keywords.Split(' ') {
+        if keyword == name { return true; }
+    }
+
+    false
+}
+
+fn SafeName(name: &String) -> String {
+    if IsSystemVerilogKeyword(name) { name + "_" } else { name }
+}
+
+class Emitter {
+    checker: *mut Checker = null,
+    used: Vector<String>,
+    outputs: Map<String, String>,
+    temps: Map<String, String>,
+    temp_declarations: String,
+    temp_assignments: String,
+    temp_counter: u32 = 0;
+
+    Emitter(&mut this, checker: *mut Checker) {
+        this.checker = checker;
+    }
+
+    fn Range(&this, width: u32) -> String {
+        if width == 1 { String() } else { " [" + String::FromInteger((width - 1) as u64) + ":0]" }
+    }
+
+    fn Declaration(&this, _type: *mut Type, name: &String) -> String {
+        match _type->kind {
+            TypeKind::Bits => "logic".ToString() + (if _type->signed { " signed" } else { "" }) + this.Range(_type->width) + " " + name,
+            TypeKind::Enum => SafeName(_type->enumeration->name) + " " + name,
+            TypeKind::Array => this.Declaration(_type->element, name) + " [0:" + String::FromInteger((_type->length - 1) as u64) + "]",
+            _ => "logic " + name
+        }
+    }
+
+    fn VariantName(&this, info: *mut EnumInfo, value: i64) -> String {
+        let index = info->FindValue(value);
+        if index < 0 { return "'" + String::FromInteger(value); }
+        info->name + "_" + info->names[index as usize]
+    }
+
+    fn Literal(&this, value: i64, _type: *mut Type, radix: u32) -> String {
+        if _type == null || _type->IsInteger() { return String::FromInteger(value); }
+        if _type->IsEnum() { return this.VariantName(_type->enumeration, value); }
+        let width = _type->BitWidth();
+        let prefix = String::FromInteger(width as u64) + "'";
+
+        if width == 1 && !_type->signed {
+            return prefix + (if value != 0 { "b1" } else { "b0" });
+        }
+
+        if _type->signed {
+            if value < 0 { return "-" + prefix + "sd" + String::FromInteger((-value) as u64); }
+            return prefix + "sd" + String::FromInteger(value as u64);
+        }
+
+        match radix {
+            16 => {
+                let digits = String::FromInteger(value as u64, 16);
+                let count = ((width + 3) / 4) as usize;
+                if digits.Length() >= count { return prefix + "h" + digits; }
+                prefix + "h" + ('0' * (count - digits.Length())) + digits
+            },
+            2 => prefix + "b" + String::FromInteger(value as u64, 2),
+            _ => prefix + "d" + String::FromInteger(value as u64)
+        }
+    }
+
+    fn Reserve(&mut this, name: &String) -> String {
+        let mut candidate = SafeName(name);
+        let mut suffix: u32 = 1;
+
+        while this.used.Contains(candidate) {
+            candidate = SafeName(name) + "_" + String::FromInteger(suffix as u64);
+            suffix += 1;
+        }
+
+        this.used.PushBack(candidate);
+        candidate
+    }
+
+    fn NewTemp(&mut this) -> String {
+        loop {
+            let candidate = "_v" + String::FromInteger(this.temp_counter as u64);
+            this.temp_counter += 1;
+
+            if !this.used.Contains(candidate) {
+                this.used.PushBack(candidate);
+                return candidate;
+            }
+        }
+    }
+
+    fn OutputName(&this, instance: *mut Symbol, port: *mut Symbol) -> String {
+        this.outputs.Get(instance->name + "." + port->name, String())
+    }
+
+    fn Hoist(&mut this, expression: *mut ASTExpression) -> String {
+        let value = this.Expression(expression, true);
+        let key = expression->resolved->Describe() + "=" + value;
+        if this.temps.Has(key) { return this.temps.Get(key, String()); }
+        let name = this.NewTemp();
+        this.temps[key] = name;
+        this.temp_declarations += Pad(1) + this.Declaration(expression->resolved, name) + ";\n";
+        this.temp_assignments += Pad(1) + "assign " + name + " = " + value + ";\n";
+        name
+    }
+
+    fn IsSelectable(&this, expression: *mut ASTExpression) -> bool {
+        if expression->constant { return false; }
+
+        match expression->kind {
+            ASTExpressionKind::Path | ASTExpressionKind::Member => true,
+            ASTExpressionKind::Index => (expression as *mut ASTIndexExpression)->base->resolved->IsArray(),
+            _ => false
+        }
+    }
+
+    fn Selectable(&mut this, expression: *mut ASTExpression) -> String {
+        if this.IsSelectable(expression) { this.Expression(expression, true) } else { this.Hoist(expression) }
+    }
+
+    fn Expression(&mut this, expression: *mut ASTExpression, top: bool) -> String {
+        if expression->constant {
+            let radix = if expression->kind == ASTExpressionKind::Integer { (expression as *mut ASTIntegerLiteral)->radix } else { 10 };
+            return this.Literal(expression->value, expression->resolved, radix);
+        }
+
+        match expression->kind {
+            ASTExpressionKind::Path => SafeName((expression as *mut ASTPathExpression)->symbol->name),
+            ASTExpressionKind::Member => {
+                let member = expression as *mut ASTMemberExpression;
+                this.OutputName(member->instance, member->port)
+            },
+            ASTExpressionKind::Unary => {
+                let unary = expression as *mut ASTUnaryExpression;
+                let operand = this.Expression(unary->operand, false);
+
+                if unary->op == ASTUnaryKind::Negate {
+                    "-" + operand
+                } else if expression->resolved->IsBool() {
+                    "!" + operand
+                } else {
+                    "~" + operand
+                }
+            },
+            ASTExpressionKind::Binary => {
+                let binary = expression as *mut ASTBinaryExpression;
+                let left = this.Expression(binary->left, false);
+                let right = this.Expression(binary->right, false);
+                let mut op = binary->op.Text();
+
+                if binary->op == ASTBinaryKind::RightShift && binary->left->resolved->signed {
+                    op = ">>>".ToString();
+                }
+
+                let text = left + " " + op + " " + right;
+                if top { text } else { "(" + text + ")" }
+            },
+            ASTExpressionKind::Index => {
+                let index = expression as *mut ASTIndexExpression;
+                let base = this.Selectable(index->base);
+                base + "[" + this.Expression(index->index, true) + "]"
+            },
+            ASTExpressionKind::Slice => {
+                let slice = expression as *mut ASTSliceExpression;
+                let base = this.Selectable(slice->base);
+                base + "[" + String::FromInteger(slice->high_value) + ":" + String::FromInteger(slice->low_value) + "]"
+            },
+            ASTExpressionKind::Call => this.Call(expression as *mut ASTCallExpression, top),
+            ASTExpressionKind::Cast => this.Cast(expression as *mut ASTCastExpression, top),
+            ASTExpressionKind::If => {
+                let conditional = expression as *mut ASTIfExpression;
+                let condition = this.Expression(conditional->condition, false);
+                let then = this.Expression(conditional->then, false);
+                let otherwise = this.Expression(conditional->otherwise, false);
+                let text = condition + " ? " + then + " : " + otherwise;
+
+                if expression->resolved->IsEnum() {
+                    return SafeName(expression->resolved->enumeration->name) + "'(" + text + ")";
+                }
+
+                if top { text } else { "(" + text + ")" }
+            },
+            _ => "/* unsupported */".ToString()
+        }
+    }
+
+    fn Call(&mut this, call: *mut ASTCallExpression, top: bool) -> String {
+        let name = call->name;
+
+        if name == "cat" {
+            let mut text = "{".ToString();
+
+            for i in 0..call->arguments.Length() {
+                if i > 0 { text += ", "; }
+                text += this.Expression(call->arguments[i], true);
+            }
+
+            return text + "}";
+        }
+
+        if name == "rep" {
+            return "{" + String::FromInteger(call->arguments[0]->value) + "{" + this.Expression(call->arguments[1], true) + "}}";
+        }
+
+        let op = if name == "any" { "|" } else if name == "all" { "&" } else { "^" };
+        let text = op + this.Expression(call->arguments[0], false);
+        if top { text } else { "(" + text + ")" }
+    }
+
+    fn Cast(&mut this, cast: *mut ASTCastExpression, top: bool) -> String {
+        let target = cast->resolved;
+        let operand = cast->operand;
+        let source = operand->resolved;
+
+        if target->IsEnum() {
+            return SafeName(target->enumeration->name) + "'(" + this.Expression(operand, true) + ")";
+        }
+
+        let source_width = source->BitWidth();
+        let source_signed = source->IsBits() && source->signed;
+        let width = target->width;
+        let mut text = String();
+
+        if width == source_width {
+            text = this.Expression(operand, true);
+            if source_signed == target->signed { return if top || this.IsSelectable(operand) { text } else { "(" + text + ")" }; }
+            return (if target->signed { "$signed(" } else { "$unsigned(" }) + text + ")";
+        }
+
+        if width < source_width {
+            let base = this.Selectable(operand);
+            text = base + (if width == 1 { "[0]".ToString() } else { "[" + String::FromInteger((width - 1) as u64) + ":0]" });
+        } else {
+            let extra = String::FromInteger((width - source_width) as u64);
+
+            if source_signed {
+                let base = this.Selectable(operand);
+                let sign = base + "[" + String::FromInteger((source_width - 1) as u64) + "]";
+                text = "{{" + extra + "{" + sign + "}}, " + base + "}";
+            } else {
+                text = "{" + extra + "'d0, " + this.Expression(operand, true) + "}";
+            }
+        }
+
+        if target->signed { "$signed(" + text + ")" } else { text }
+    }
+
+    fn Target(&mut this, target: *mut ASTExpression) -> String {
+        match target->kind {
+            ASTExpressionKind::Index => {
+                let index = target as *mut ASTIndexExpression;
+                this.Target(index->base) + "[" + this.Expression(index->index, true) + "]"
+            },
+            ASTExpressionKind::Slice => {
+                let slice = target as *mut ASTSliceExpression;
+                this.Target(slice->base) + "[" + String::FromInteger(slice->high_value) + ":" + String::FromInteger(slice->low_value) + "]"
+            },
+            _ => SafeName((target as *mut ASTPathExpression)->symbol->name)
+        }
+    }
+
+    fn Statement(&mut this, statement: *mut ASTStatement, indent: &String, output: &mut String) {
+        match statement->kind {
+            ASTStatementKind::Block => {
+                for child in (statement as *mut ASTBlockStatement)->statements {
+                    this.Statement(child, indent, output);
+                }
+            },
+            ASTStatementKind::Assign => {
+                let assign = statement as *mut ASTAssignStatement;
+                let target = this.Target(assign->target);
+                let value = this.Expression(assign->value, true);
+                output += indent + target + (if assign->nonblocking { " <= " } else { " = " }) + value + ";\n";
+            },
+            ASTStatementKind::If => this.If(statement as *mut ASTIfStatement, indent, output, false),
+            ASTStatementKind::Match => {
+                let matching = statement as *mut ASTMatchStatement;
+                output += indent + "case (" + this.Expression(matching->scrutinee, true) + ")\n";
+                let inner = indent + Pad(1);
+
+                for arm in matching->arms {
+                    let mut labels = String();
+
+                    if arm->wildcard {
+                        labels = "default".ToString();
+                    } else {
+                        for i in 0..arm->patterns.Length() {
+                            if i > 0 { labels += ", "; }
+                            labels += this.Expression(arm->patterns[i], true);
+                        }
+                    }
+
+                    output += inner + labels + ": begin\n";
+                    this.Statement(arm->body, inner + Pad(1), output);
+                    output += inner + "end\n";
+                }
+
+                output += indent + "endcase\n";
+            }
+        }
+    }
+
+    fn If(&mut this, statement: *mut ASTIfStatement, indent: &String, output: &mut String, continued: bool) {
+        if !continued { output += indent; }
+        output += "if (" + this.Expression(statement->condition, true) + ") begin\n";
+        this.Statement(statement->then, indent + Pad(1), output);
+        output += indent + "end";
+
+        if statement->otherwise == null {
+            output += "\n";
+            return;
+        }
+
+        if statement->otherwise->kind == ASTStatementKind::If {
+            output += " else ";
+            this.If(statement->otherwise as *mut ASTIfStatement, indent, output, true);
+            return;
+        }
+
+        output += " else begin\n";
+        this.Statement(statement->otherwise, indent + Pad(1), output);
+        output += indent + "end\n";
+    }
+
+    fn Enum(&this, info: *mut EnumInfo, indent: &String) -> String {
+        let mut text = indent + "typedef enum logic" + this.Range(info->width) + " {\n";
+        let base = this.checker->MakeBits(info->width, false);
+
+        for i in 0..info->names.Length() {
+            text += indent + Pad(1) + info->name + "_" + info->names[i] + " = " + this.Literal(info->values[i], base, 10);
+            text += if i + 1 < info->names.Length() { ",\n" } else { "\n" };
+        }
+
+        text + indent + "} " + SafeName(info->name) + ";\n"
+    }
+
+    fn Instance(&mut this, symbol: *mut Symbol) -> String {
+        let instance = symbol->instance;
+        let module = symbol->module;
+        let mut text = Pad(1) + SafeName(module->name) + " " + SafeName(symbol->name) + " (\n";
+
+        for i in 0..module->ports.Length() {
+            let port = module->ports[i];
+            let mut value = String();
+
+            if port->input {
+                for connection in instance->connections {
+                    if connection->port == port { value = this.Expression(connection->value, true); }
+                }
+            } else {
+                value = this.OutputName(symbol, port);
+            }
+
+            text += Pad(2) + "." + SafeName(port->name) + "(" + value + ")";
+            text += if i + 1 < module->ports.Length() { ",\n" } else { "\n" };
+        }
+
+        text + Pad(1) + ");\n"
+    }
+
+    fn Seq(&mut this, item: *mut ASTSeqItem) -> String {
+        let clock = this.Selectable(item->clock);
+        let mut text = Pad(1) + "always_ff @(posedge " + clock;
+
+        if item->reset == null {
+            text += ") begin\n";
+            this.Statement(item->body, Pad(2), text);
+            return text + Pad(1) + "end\n";
+        }
+
+        let reset = this.Selectable(item->reset);
+        text += " or posedge " + reset + ") begin\n";
+        text += Pad(2) + "if (" + reset + ") begin\n";
+
+        for symbol in item->registers {
+            text += Pad(3) + SafeName(symbol->name) + " <= " + this.Expression(symbol->init, true) + ";\n";
+        }
+
+        text += Pad(2) + "end else begin\n";
+        this.Statement(item->body, Pad(3), text);
+        text += Pad(2) + "end\n";
+        text + Pad(1) + "end\n"
+    }
+
+    fn Module(&mut this, module: *mut ModuleInfo) -> String {
+        this.used.Clear();
+        this.outputs.Clear();
+        this.temps.Clear();
+        (this.temp_declarations, this.temp_assignments, this.temp_counter) = (String(), String(), 0);
+        let item = module->item;
+
+        for port in module->ports { this.used.PushBack(SafeName(port->name)); }
+        for symbol in module->signals { this.used.PushBack(SafeName(symbol->name)); }
+
+        for symbol in module->signals {
+            if symbol->kind != SymbolKind::Instance { continue; }
+
+            for port in symbol->module->ports {
+                if !port->input {
+                    this.outputs[symbol->name + "." + port->name] = this.Reserve(symbol->name + "_" + port->name);
+                }
+            }
+        }
+
+        let mut text = "module " + SafeName(module->name);
+
+        if module->ports.Empty() {
+            text += ";\n";
+        } else {
+            text += " (\n";
+
+            for i in 0..module->ports.Length() {
+                let port = module->ports[i];
+                text += Pad(1) + (if port->input { "input " } else { "output " }) + this.Declaration(port->_type, SafeName(port->name));
+                text += if i + 1 < module->ports.Length() { ",\n" } else { "\n" };
+            }
+
+            text += ");\n";
+        }
+
+        let mut declarations = String();
+        for info in module->enums { declarations += this.Enum(info, Pad(1)); }
+
+        for symbol in module->signals {
+            if symbol->kind == SymbolKind::Instance {
+                for port in symbol->module->ports {
+                    if !port->input { declarations += Pad(1) + this.Declaration(port->_type, this.OutputName(symbol, port)) + ";\n"; }
+                }
+
+                continue;
+            }
+
+            let mut line = Pad(1) + this.Declaration(symbol->_type, SafeName(symbol->name));
+            if symbol->power_on { line += " = " + this.Expression(symbol->init, true); }
+            declarations += line + ";\n";
+        }
+
+        let mut initials = String();
+
+        for port in module->ports {
+            if port->power_on { initials += Pad(1) + "initial " + SafeName(port->name) + " = " + this.Expression(port->init, true) + ";\n"; }
+        }
+
+        let mut assigns = String();
+        let mut body = String();
+
+        for child in item->items {
+            match child->kind {
+                ASTItemKind::Signal => {
+                    let signal = child as *mut ASTSignalItem;
+                    let symbol = signal->symbol;
+
+                    if symbol->kind == SymbolKind::Instance {
+                        body += "\n" + this.Instance(symbol);
+                    } else if symbol->kind == SymbolKind::Let {
+                        assigns += Pad(1) + "assign " + SafeName(symbol->name) + " = " + this.Expression(signal->value, true) + ";\n";
+                    }
+                },
+                ASTItemKind::Assign => {
+                    let assign = child as *mut ASTAssignItem;
+                    assigns += Pad(1) + "assign " + this.Target(assign->target) + " = " + this.Expression(assign->value, true) + ";\n";
+                },
+                ASTItemKind::Comb => {
+                    let mut block = Pad(1) + "always_comb begin\n";
+                    this.Statement((child as *mut ASTCombItem)->body, Pad(2), block);
+                    body += "\n" + block + Pad(1) + "end\n";
+                },
+                ASTItemKind::Seq => {
+                    body += "\n" + this.Seq(child as *mut ASTSeqItem);
+                },
+                _ => {}
+            }
+        }
+
+        let mut sections = declarations + this.temp_declarations;
+        if !initials.Empty() { sections += "\n" + initials; }
+        if !this.temp_assignments.Empty() || !assigns.Empty() { sections += "\n" + this.temp_assignments + assigns; }
+        text + sections + body + "endmodule\n"
+    }
+
+    pub fn Emit(&mut this, source: &String) -> String {
+        let mut text = "// Generated by Veles from " + source + ". Do not edit.\n";
+
+        for info in this.checker->enums {
+            text += "\n" + this.Enum(info, String());
+        }
+
+        for module in this.checker->modules {
+            if module->item->external { continue; }
+            text += "\n" + this.Module(module);
+        }
+
+        text
+    }
+}

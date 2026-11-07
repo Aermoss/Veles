@@ -1,0 +1,274 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "src/Token.zir", "src/Logger.zir", "src/Source.zir" : *]
+
+class Lexer {
+    file: *SourceFile = null,
+    file_id: u32 = 0,
+    length: usize = 0,
+    index: usize = 0;
+
+    Lexer(&mut this, file_id: u32) {
+        this.file_id = file_id;
+        this.file = Sources()->File(file_id);
+        this.length = this.file->text.Length();
+    }
+
+    fn IsDigit(&this, character: i8) -> bool {
+        character >= '0' && character <= '9'
+    }
+
+    fn IsHexDigit(&this, character: i8) -> bool {
+        (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F')
+    }
+
+    fn IsAlpha(&this, character: i8) -> bool {
+        (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character == '_'
+    }
+
+    fn IsAlphaNum(&this, character: i8) -> bool {
+        this.IsAlpha(character) || this.IsDigit(character)
+    }
+
+    fn CurrentChar(&this) -> i8 {
+        if this.index >= this.length { return '\0'; }
+        this.file->text.Data()[this.index]
+    }
+
+    fn PeekChar(&this, offset: usize) -> i8 {
+        let peek_index = this.index + offset;
+        if peek_index >= this.length { return '\0'; }
+        this.file->text.Data()[peek_index]
+    }
+
+    fn Span(&this, start: usize) -> SourceSpan {
+        SourceSpan { file: this.file_id, start: start as u32, end: this.index as u32 }
+    }
+
+    fn Make(&this, _type: TokenType, start: usize) -> Token {
+        let mut token: Token;
+        (token._type, token.span) = (_type, this.Span(start));
+        token
+    }
+
+    pub fn Text(&this, span: SourceSpan) -> String {
+        String(this.file->text, span.start as usize, (span.end - span.start) as usize)
+    }
+
+    pub fn Unescape(&this, span: SourceSpan) -> String {
+        let text = this.Text(span);
+        let mut value = String();
+        let mut i: usize = 1;
+
+        while i + 1 < text.Length() {
+            let character = text[i];
+
+            if character == '\\' && i + 2 < text.Length() {
+                i += 1;
+                let escaped = text[i];
+
+                value += match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    _ => escaped
+                };
+            } else {
+                value += character;
+            }
+
+            i += 1;
+        }
+
+        value
+    }
+
+    fn SkipComment(&mut this) -> bool {
+        if this.CurrentChar() != '/' { return false; }
+
+        if this.PeekChar(1) == '/' {
+            while this.CurrentChar() != '\n' && this.CurrentChar() != '\0' {
+                this.index += 1;
+            }
+
+            return true;
+        }
+
+        if this.PeekChar(1) == '*' {
+            let start = this.index;
+            this.index += 2;
+
+            while this.CurrentChar() != '\0' {
+                if this.CurrentChar() == '*' && this.PeekChar(1) == '/' {
+                    this.index += 2;
+                    return true;
+                }
+
+                this.index += 1;
+            }
+
+            Logger::Log("Unterminated block comment.", this.Span(start), LogSeverity::Error);
+            return true;
+        }
+
+        false
+    }
+
+    fn LexString(&mut this) -> Token {
+        let start = this.index;
+        this.index += 1;
+
+        while this.CurrentChar() != '"' && this.CurrentChar() != '\n' && this.CurrentChar() != '\0' {
+            if this.CurrentChar() == '\\' && this.PeekChar(1) != '\0' {
+                this.index += 1;
+            }
+
+            this.index += 1;
+        }
+
+        if this.CurrentChar() == '"' {
+            this.index += 1;
+        } else {
+            Logger::Log("Unterminated string literal.", this.Span(start), LogSeverity::Error);
+        }
+
+        this.Make(TokenType::String, start)
+    }
+
+    fn LexNumber(&mut this) -> Token {
+        let start = this.index;
+
+        if this.CurrentChar() == '0' && (this.PeekChar(1) == 'x' || this.PeekChar(1) == 'X' || this.PeekChar(1) == 'b' || this.PeekChar(1) == 'B' || this.PeekChar(1) == 'o' || this.PeekChar(1) == 'O') {
+            this.index += 2;
+        }
+
+        while this.IsHexDigit(this.CurrentChar()) || this.CurrentChar() == '_' {
+            this.index += 1;
+        }
+
+        while this.IsAlphaNum(this.CurrentChar()) { this.index += 1; }
+
+        this.Make(TokenType::Integer, start)
+    }
+
+    fn LexIdentifier(&mut this) -> Token {
+        let start = this.index;
+
+        while this.IsAlphaNum(this.CurrentChar()) {
+            this.index += 1;
+        }
+
+        let token = this.Make(TokenType::Identifier, start);
+        this.Make(StringToKeyword(this.Text(token.span)), start)
+    }
+
+    fn LexSymbol(&mut this) -> Token {
+        let start = this.index;
+        let (current, next) = (this.CurrentChar(), this.PeekChar(1));
+
+        let (_type, length) = match current {
+            '=' if next == '=' => (TokenType::Equal, 2),
+            '=' if next == '>' => (TokenType::FatArrow, 2),
+            '=' => (TokenType::Assign, 1),
+            '!' if next == '=' => (TokenType::NotEqual, 2),
+            '!' => (TokenType::Not, 1),
+            '<' if next == '=' => (TokenType::LessEqual, 2),
+            '<' if next == '<' => (TokenType::LeftShift, 2),
+            '<' if next == '-' => (TokenType::NonBlocking, 2),
+            '<' => (TokenType::Less, 1),
+            '>' if next == '=' => (TokenType::GreaterEqual, 2),
+            '>' if next == '>' => (TokenType::RightShift, 2),
+            '>' => (TokenType::Greater, 1),
+            '&' if next == '&' => (TokenType::And, 2),
+            '&' => (TokenType::BitwiseAnd, 1),
+            '|' if next == '|' => (TokenType::Or, 2),
+            '|' => (TokenType::BitwiseOr, 1),
+            '-' if next == '>' => (TokenType::Arrow, 2),
+            '-' => (TokenType::Minus, 1),
+            ':' if next == ':' => (TokenType::DoubleColon, 2),
+            ':' => (TokenType::Colon, 1),
+            '#' if next == '[' => (TokenType::PreprocessorStart, 2),
+            '^' => (TokenType::BitwiseXor, 1),
+            '+' => (TokenType::Plus, 1),
+            '*' => (TokenType::Mul, 1),
+            '/' => (TokenType::Div, 1),
+            '%' => (TokenType::Mod, 1),
+            '(' => (TokenType::LeftParen, 1),
+            ')' => (TokenType::RightParen, 1),
+            '{' => (TokenType::LeftBrace, 1),
+            '}' => (TokenType::RightBrace, 1),
+            '[' => (TokenType::LeftBracket, 1),
+            ']' => (TokenType::RightBracket, 1),
+            '.' => (TokenType::Dot, 1),
+            ',' => (TokenType::Comma, 1),
+            ';' => (TokenType::Semicolon, 1),
+            _ => (TokenType::Unknown, 1)
+        };
+
+        this.index += length as usize;
+        this.Make(_type, start)
+    }
+
+    pub fn Next(&mut this) -> Token {
+        loop {
+            let character = this.CurrentChar();
+
+            if character == ' ' || character == '\t' || character == '\r' || character == '\n' {
+                this.index += 1;
+                continue;
+            }
+
+            if this.SkipComment() {
+                continue;
+            }
+
+            let start = this.index;
+
+            if character == '\0' {
+                return this.Make(TokenType::EndOfFile, start);
+            }
+
+            if character == '"' {
+                return this.LexString();
+            }
+
+            if this.IsDigit(character) {
+                return this.LexNumber();
+            }
+
+            if this.IsAlpha(character) {
+                return this.LexIdentifier();
+            }
+
+            let token = this.LexSymbol();
+
+            if token._type == TokenType::Unknown {
+                if (character as u8) > 0x7F {
+                    while (this.CurrentChar() as u8 & 0xC0) == 0x80 { this.index += 1; }
+                    Logger::Log("Non-ASCII characters are not allowed outside of strings and comments.", this.Span(start), LogSeverity::Error);
+                } else {
+                    Logger::Log("Invalid symbol '" + character.ToString() + "'.", token.span, LogSeverity::Error);
+                }
+
+                continue;
+            }
+
+            return token;
+        }
+    }
+}

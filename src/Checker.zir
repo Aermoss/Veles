@@ -1,0 +1,1717 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "std/map", "std/arena", "std/opt", "src/Logger.zir", "src/AST.zir", "src/Semantic.zir" : *]
+
+const MAX_WIDTH: i64 = 4096;
+const MAX_LENGTH: i64 = 16777216;
+
+enum Context: u8 {
+    Module, Comb, Seq
+}
+
+fn Quote(name: &String) -> String {
+    "'" + name + "'"
+}
+
+fn Clog2(value: i64) -> i64 {
+    let mut result: i64 = 0;
+    let mut power: i64 = 1;
+
+    while power < value {
+        power <<= 1;
+        result += 1;
+    }
+
+    result
+}
+
+fn Wrap(value: i64, target: *mut Type) -> i64 {
+    if !target->IsBits() || target->width >= 63 { return value; }
+    let width = target->width as i64;
+    let mut result = value & (((1 as i64) << width) - 1);
+
+    if target->signed && ((result >> (width - 1)) & 1) == 1 {
+        result -= (1 as i64) << width;
+    }
+
+    result
+}
+
+fn Fits(value: i64, target: *mut Type) -> bool {
+    if !target->IsBits() { return false; }
+    let width = target->width as i64;
+
+    if target->signed {
+        if width >= 64 { return true; }
+        let limit = (1 as i64) << (width - 1);
+        return value >= -limit && value < limit;
+    }
+
+    if value < 0 { return false; }
+    if width >= 63 { return true; }
+    value < ((1 as i64) << width)
+}
+
+fn Union(a: &Vector<*mut Symbol>, b: &Vector<*mut Symbol>) -> Vector<*mut Symbol> {
+    let mut result = Vector<*mut Symbol>(a);
+
+    for symbol in b {
+        if !result.Contains(symbol) { result.PushBack(symbol); }
+    }
+
+    result
+}
+
+fn Intersect(a: &Vector<*mut Symbol>, b: &Vector<*mut Symbol>) -> Vector<*mut Symbol> {
+    let mut result = Vector<*mut Symbol>();
+
+    for symbol in a {
+        if b.Contains(symbol) { result.PushBack(symbol); }
+    }
+
+    result
+}
+
+class Checker {
+    arena: Arena,
+    pub global: *mut Scope = null,
+    pub enums: Vector<*mut EnumInfo>,
+    pub modules: Vector<*mut ModuleInfo>,
+    error_type: *mut Type = null,
+    integer_type: *mut Type = null,
+    bool_type: *mut Type = null,
+    clock_type: *mut Type = null,
+    reset_type: *mut Type = null,
+    current: *mut ModuleInfo = null,
+    block: *mut ASTItem = null;
+
+    Checker(&mut this) {
+        this.global = this.arena.New<Scope>(null);
+        this.error_type = this.arena.New<Type>(TypeKind::Error);
+        this.integer_type = this.arena.New<Type>(TypeKind::Integer);
+        this.clock_type = this.arena.New<Type>(TypeKind::Clock);
+        this.reset_type = this.arena.New<Type>(TypeKind::Reset);
+        this.bool_type = this.MakeBits(1, false);
+    }
+
+    fn Error(&this, message: &String, span: SourceSpan) {
+        Logger::Log(message, span, LogSeverity::Error);
+    }
+
+    fn Error(&this, message: *i8, span: SourceSpan) {
+        Logger::Log(message, span, LogSeverity::Error);
+    }
+
+    fn Note(&this, message: &String, span: SourceSpan) {
+        Logger::Log(message, span, LogSeverity::Info);
+    }
+
+    fn Note(&this, message: *i8, span: SourceSpan) {
+        Logger::Log(message, span, LogSeverity::Info);
+    }
+
+    pub fn MakeBits(&mut this, width: u32, signed: bool) -> *mut Type {
+        let result = this.arena.New<Type>(TypeKind::Bits);
+        (result->width, result->signed) = (width, signed);
+        result
+    }
+
+    fn ValueType(&this, _type: *mut Type) -> *mut Type {
+        if _type->IsReset() { this.bool_type } else { _type }
+    }
+
+    fn ParseBuiltinWidth(&this, name: &String) -> i64 {
+        if name.Length() < 2 || (name[0] != 'u' && name[0] != 'i') || name[1] == '0' { return -1; }
+        let mut width: i64 = 0;
+
+        for i in 1..name.Length() {
+            let character = name[i];
+            if character < '0' || character > '9' { return -1; }
+            width = width * 10 + (character - '0') as i64;
+            if width > MAX_WIDTH { return MAX_WIDTH + 1; }
+        }
+
+        width
+    }
+
+    fn ResolveType(&mut this, ast: *mut ASTType, scope: *mut Scope) -> *mut Type {
+        if ast == null { return this.error_type; }
+
+        match ast->kind {
+            ASTTypeKind::Named => {
+                let name = (ast as *mut ASTNamedType)->name;
+                if name == "bool" { return this.bool_type; }
+                if name == "clock" { return this.clock_type; }
+                if name == "reset" { return this.reset_type; }
+                let width = this.ParseBuiltinWidth(name);
+
+                if width > MAX_WIDTH {
+                    this.Error("Bit vectors can be at most " + String::FromInteger(MAX_WIDTH) + " bits wide.", ast->span);
+                    return this.error_type;
+                }
+
+                if width > 0 {
+                    return this.MakeBits(width as u32, name[0] == 'i');
+                }
+
+                let symbol = scope->Lookup(name);
+
+                if symbol == null {
+                    this.Error("Cannot find type " + Quote(name) + " in this scope.", ast->span);
+                    return this.error_type;
+                }
+
+                if !this.ResolveSymbol(symbol) { return this.error_type; }
+
+                match symbol->kind {
+                    SymbolKind::Alias => symbol->_type,
+                    SymbolKind::Enumeration => symbol->enumeration->_type,
+                    _ => {
+                        this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not a type.", ast->span);
+                        this.error_type
+                    }
+                }
+            },
+            ASTTypeKind::Sized => {
+                let sized = ast as *mut ASTSizedType;
+
+                match this.EvalConstant(sized->width, scope) {
+                    Option<i64>::Some(width) => {
+                        if width < 1 || width > MAX_WIDTH {
+                            this.Error("Width must be between 1 and " + String::FromInteger(MAX_WIDTH) + ", found " + String::FromInteger(width) + ".", sized->width->span);
+                            return this.error_type;
+                        }
+
+                        this.MakeBits(width as u32, sized->signed)
+                    },
+                    Option<i64>::None => this.error_type
+                }
+            },
+            ASTTypeKind::Array => {
+                let array = ast as *mut ASTArrayType;
+                let element = this.ResolveType(array->element, scope);
+                if element->IsError() { return this.error_type; }
+
+                if !element->IsBits() && !element->IsEnum() {
+                    this.Error("Memory elements must be bit vectors or enums, found " + Quote(element->Describe()) + ".", array->element->span);
+                    return this.error_type;
+                }
+
+                match this.EvalConstant(array->length, scope) {
+                    Option<i64>::Some(length) => {
+                        if length < 1 || length > MAX_LENGTH {
+                            this.Error("Memory length must be between 1 and " + String::FromInteger(MAX_LENGTH) + ", found " + String::FromInteger(length) + ".", array->length->span);
+                            return this.error_type;
+                        }
+
+                        let result = this.arena.New<Type>(TypeKind::Array);
+                        (result->element, result->length) = (element, length as u32);
+                        result
+                    },
+                    Option<i64>::None => this.error_type
+                }
+            }
+        }
+    }
+
+    fn Define(&mut this, scope: *mut Scope, symbol: *mut Symbol) {
+        let existing = scope->LookupLocal(symbol->name);
+
+        if existing != null {
+            this.Error(Quote(symbol->name) + " is already defined.", symbol->span);
+            this.Note("Previous definition is here.", existing->span);
+            return;
+        }
+
+        if symbol->name == "bool" || symbol->name == "clock" || symbol->name == "reset" || this.ParseBuiltinWidth(symbol->name) > 0 {
+            this.Error(Quote(symbol->name) + " is a built-in type name and cannot be redefined.", symbol->span);
+            return;
+        }
+
+        symbol->scope = scope;
+        scope->symbols[symbol->name] = symbol;
+    }
+
+    fn NewSymbol(&mut this, kind: SymbolKind, name: &String, span: SourceSpan, node: *mut ASTNode) -> *mut Symbol {
+        let symbol = this.arena.New<Symbol>(kind, name, span);
+        symbol->node = node;
+        symbol
+    }
+
+    fn Declare(&mut this, item: *mut ASTItem, scope: *mut Scope, owner: *mut ModuleInfo) {
+        match item->kind {
+            ASTItemKind::Const => {
+                let constant = item as *mut ASTConstItem;
+                constant->symbol = this.NewSymbol(SymbolKind::Constant, constant->name, item->span, item);
+                this.Define(scope, constant->symbol);
+            },
+            ASTItemKind::Type => {
+                let alias = item as *mut ASTTypeItem;
+                alias->symbol = this.NewSymbol(SymbolKind::Alias, alias->name, item->span, item);
+                this.Define(scope, alias->symbol);
+            },
+            ASTItemKind::Enum => {
+                let enumeration = item as *mut ASTEnumItem;
+                let symbol = this.NewSymbol(SymbolKind::Enumeration, enumeration->name, item->span, item);
+                let info = this.arena.New<EnumInfo>(enumeration->name, enumeration);
+                info->local = owner != null;
+                info->_type = this.arena.New<Type>(TypeKind::Enum);
+                info->_type->enumeration = info;
+                symbol->enumeration = info;
+                enumeration->symbol = symbol;
+                this.Define(scope, symbol);
+
+                if owner == null {
+                    this.enums.PushBack(info);
+                } else {
+                    owner->enums.PushBack(info);
+                }
+            },
+            ASTItemKind::Module => {
+                let module = item as *mut ASTModuleItem;
+                let symbol = this.NewSymbol(SymbolKind::Module, module->name, item->span, item);
+                let info = this.arena.New<ModuleInfo>(module->name, module);
+                (info->symbol, symbol->module, module->info) = (symbol, info, info);
+                this.Define(scope, symbol);
+                this.modules.PushBack(info);
+            },
+            ASTItemKind::Signal => {
+                let signal = item as *mut ASTSignalItem;
+
+                let kind = match signal->signal {
+                    ASTSignalKind::Let => if signal->value != null && signal->value->kind == ASTExpressionKind::Instance { SymbolKind::Instance } else { SymbolKind::Let },
+                    ASTSignalKind::Wire => SymbolKind::Wire,
+                    ASTSignalKind::Reg => SymbolKind::Register
+                };
+
+                let symbol = this.NewSymbol(kind, signal->name, item->span, item);
+                symbol->registered = kind == SymbolKind::Register;
+                signal->symbol = symbol;
+                this.Define(scope, symbol);
+                owner->signals.PushBack(symbol);
+            },
+            _ => {}
+        }
+    }
+
+    fn ResolveSymbol(&mut this, symbol: *mut Symbol) -> bool {
+        if symbol->resolved { return !symbol->_type->IsError(); }
+
+        if symbol->resolving {
+            this.Error(Quote(symbol->name) + " depends on itself.", symbol->span);
+            symbol->_type = this.error_type;
+            return false;
+        }
+
+        symbol->resolving = true;
+        symbol->_type = this.error_type;
+
+        match symbol->kind {
+            SymbolKind::Constant => this.ResolveConstant(symbol),
+            SymbolKind::Alias => {
+                symbol->_type = this.ResolveType((symbol->node as *mut ASTTypeItem)->aliased, symbol->scope);
+            },
+            SymbolKind::Enumeration => this.ResolveEnum(symbol),
+            SymbolKind::Module => this.ResolvePorts(symbol->module),
+            SymbolKind::Let | SymbolKind::Wire | SymbolKind::Register => this.ResolveSignal(symbol),
+            SymbolKind::Instance => this.ResolveInstance(symbol),
+            SymbolKind::Port => {}
+        }
+
+        (symbol->resolving, symbol->resolved) = (false, true);
+        !symbol->_type->IsError()
+    }
+
+    fn ResolveConstant(&mut this, symbol: *mut Symbol) {
+        let item = symbol->node as *mut ASTConstItem;
+        let mut _type = this.integer_type;
+
+        if item->declared != null {
+            _type = this.ResolveType(item->declared, symbol->scope);
+            if _type->IsError() { return; }
+
+            if !_type->IsBits() {
+                this.Error("Constants must be integers or bit vectors, found " + Quote(_type->Describe()) + ".", item->declared->span);
+                return;
+            }
+        }
+
+        match this.EvalConstant(item->value, symbol->scope) {
+            Option<i64>::Some(value) => {
+                if !_type->IsInteger() && !Fits(value, _type) {
+                    this.Error("Constant " + String::FromInteger(value) + " does not fit in " + Quote(_type->Describe()) + ".", item->value->span);
+                    return;
+                }
+
+                (symbol->value, symbol->_type) = (value, _type);
+            },
+            Option<i64>::None => {}
+        }
+    }
+
+    fn ResolveEnum(&mut this, symbol: *mut Symbol) {
+        let info = symbol->enumeration;
+        let item = info->item;
+        let mut width: i64 = -1;
+
+        if item->base != null {
+            let base = this.ResolveType(item->base, symbol->scope);
+            if base->IsError() { return; }
+
+            if !base->IsBits() || base->signed {
+                this.Error("The base type of an enum must be an unsigned bit vector, found " + Quote(base->Describe()) + ".", item->base->span);
+                return;
+            }
+
+            width = base->width as i64;
+        }
+
+        if item->variants.Empty() {
+            this.Error("Enum " + Quote(info->name) + " has no variants.", item->span);
+            return;
+        }
+
+        let mut next: i64 = 0;
+        let mut largest: i64 = 0;
+        let mut valid = true;
+
+        for variant in item->variants {
+            let mut value = next;
+
+            if variant->value != null {
+                match this.EvalConstant(variant->value, symbol->scope) {
+                    Option<i64>::Some(result) => { value = result; },
+                    Option<i64>::None => {
+                        valid = false;
+                        continue;
+                    }
+                }
+            }
+
+            if value < 0 {
+                this.Error("Enum values cannot be negative.", variant->span);
+                valid = false;
+            }
+
+            if info->Find(variant->name) >= 0 {
+                this.Error("Variant " + Quote(variant->name) + " is already defined in " + Quote(info->name) + ".", variant->span);
+                valid = false;
+            }
+
+            let duplicate = info->FindValue(value);
+
+            if duplicate >= 0 {
+                this.Error("Variant " + Quote(variant->name) + " has the same value as " + Quote(info->names[duplicate as usize]) + ".", variant->span);
+                valid = false;
+            }
+
+            info->names.PushBack(variant->name);
+            info->values.PushBack(value);
+            if value > largest { largest = value; }
+            next = value + 1;
+        }
+
+        if !valid { return; }
+
+        if width < 0 {
+            width = Clog2(largest + 1);
+            if width < 1 { width = 1; }
+        } else if width < 63 && largest >= ((1 as i64) << width) {
+            this.Error("Enum " + Quote(info->name) + " has a value that does not fit in " + String::FromInteger(width) + " bits.", item->span);
+            return;
+        }
+
+        info->width = width as u32;
+        symbol->_type = info->_type;
+    }
+
+    fn ResolvePorts(&mut this, module: *mut ModuleInfo) {
+        let item = module->item;
+        module->scope = this.arena.New<Scope>(this.global);
+        let mut valid = true;
+
+        for port in item->ports {
+            let symbol = this.NewSymbol(SymbolKind::Port, port->name, port->span, port);
+            (symbol->input, symbol->output, symbol->registered) = (port->input, !port->input, port->registered);
+            symbol->_type = this.ResolveType(port->declared, this.global);
+            (symbol->resolved, symbol->init) = (true, port->init);
+            port->symbol = symbol;
+            this.Define(module->scope, symbol);
+            module->ports.PushBack(symbol);
+
+            if symbol->_type->IsError() {
+                valid = false;
+                continue;
+            }
+
+            if symbol->_type->IsArray() {
+                this.Error("Memories cannot be used as ports.", port->declared->span);
+                valid = false;
+            }
+
+            if port->registered && (symbol->_type->IsClock() || symbol->_type->IsReset()) {
+                this.Error("A " + Quote(symbol->_type->Describe()) + " port cannot be a register.", port->declared->span);
+                valid = false;
+            }
+
+            if port->input {
+                symbol->driver = DriverKind::Input;
+                if symbol->_type->IsClock() && module->clock == null { module->clock = symbol; }
+                if symbol->_type->IsReset() && module->reset == null { module->reset = symbol; }
+            }
+        }
+
+        module->ports_resolved = true;
+        module->symbol->_type = if valid { this.integer_type } else { this.error_type };
+    }
+
+    fn ResolveSignal(&mut this, symbol: *mut Symbol) {
+        let item = symbol->node as *mut ASTSignalItem;
+        let scope = symbol->scope;
+
+        if item->signal == ASTSignalKind::Let {
+            symbol->driver = DriverKind::Assign;
+            (symbol->driver_node, symbol->driver_span) = (item, item->span);
+
+            if item->declared != null {
+                let _type = this.ResolveType(item->declared, scope);
+                if _type->IsError() { return; }
+
+                if _type->IsArray() {
+                    this.Error("Memories can only be declared with 'reg'.", item->declared->span);
+                    return;
+                }
+
+                symbol->_type = _type;
+                this.CheckExpression(item->value, scope, Context::Module, _type);
+                this.Coerce(item->value, _type);
+                return;
+            }
+
+            let _type = this.CheckExpression(item->value, scope, Context::Module, null);
+            if _type->IsError() { return; }
+
+            if _type->IsInteger() {
+                this.Error("Cannot infer the width of " + Quote(symbol->name) + "; add a type such as 'let " + symbol->name + ": u8 = ...' or use 'const'.", item->span);
+                return;
+            }
+
+            symbol->_type = _type;
+            return;
+        }
+
+        let _type = this.ResolveType(item->declared, scope);
+        if _type->IsError() { return; }
+
+        if item->signal == ASTSignalKind::Wire {
+            if _type->IsArray() {
+                this.Error("Memories can only be declared with 'reg'.", item->declared->span);
+                return;
+            }
+
+            symbol->_type = _type;
+            return;
+        }
+
+        if _type->IsClock() || _type->IsReset() {
+            this.Error("A register cannot have the type " + Quote(_type->Describe()) + ".", item->declared->span);
+            return;
+        }
+
+        symbol->_type = _type;
+
+        if item->value != null {
+            if _type->IsArray() {
+                this.Error("Memories cannot have an initial value yet.", item->value->span);
+                return;
+            }
+
+            this.CheckInitial(item->value, scope, _type);
+            symbol->init = item->value;
+        }
+    }
+
+    fn CheckInitial(&mut this, value: *mut ASTExpression, scope: *mut Scope, _type: *mut Type) {
+        let actual = this.CheckExpression(value, scope, Context::Module, _type);
+        if actual->IsError() { return; }
+
+        if !value->constant {
+            this.Error("The initial value of a register must be a constant.", value->span);
+            return;
+        }
+
+        this.Coerce(value, _type);
+    }
+
+    fn InstanceModule(&mut this, symbol: *mut Symbol) -> *mut ModuleInfo {
+        if symbol->module != null { return symbol->module; }
+        let instance = (symbol->node as *mut ASTSignalItem)->value as *mut ASTInstanceExpression;
+        let module_symbol = this.global->Lookup(instance->module);
+
+        if module_symbol == null || module_symbol->kind != SymbolKind::Module {
+            this.Error("Cannot find module " + Quote(instance->module) + ".", instance->span);
+            return null;
+        }
+
+        if !this.ResolveSymbol(module_symbol) { return null; }
+
+        if module_symbol->module == this.current {
+            this.Error("Module " + Quote(instance->module) + " cannot instantiate itself.", instance->span);
+            return null;
+        }
+
+        symbol->module = module_symbol->module;
+        symbol->module
+    }
+
+    fn ResolveInstance(&mut this, symbol: *mut Symbol) {
+        let item = symbol->node as *mut ASTSignalItem;
+        let instance = item->value as *mut ASTInstanceExpression;
+        let scope = symbol->scope;
+        (instance->target, symbol->instance) = (symbol, instance);
+        let module = this.InstanceModule(symbol);
+        if module == null { return; }
+        let mut connected = Vector<*mut Symbol>();
+        let mut valid = true;
+
+        for connection in instance->connections {
+            let port = module->FindPort(connection->name);
+
+            if port == null {
+                this.Error("Module " + Quote(module->name) + " has no port named " + Quote(connection->name) + ".", connection->span);
+                valid = false;
+                continue;
+            }
+
+            if !port->input {
+                this.Error(Quote(connection->name) + " is an output of " + Quote(module->name) + "; read it as '" + symbol->name + "." + connection->name + "' instead.", connection->span);
+                valid = false;
+                continue;
+            }
+
+            if connected.Contains(port) {
+                this.Error("Port " + Quote(connection->name) + " is connected more than once.", connection->span);
+                valid = false;
+                continue;
+            }
+
+            connected.PushBack(port);
+            connection->port = port;
+            if !this.CheckConnection(connection->value, scope, port) { valid = false; }
+        }
+
+        for port in module->ports {
+            if !port->input || connected.Contains(port) { continue; }
+            let mut fallback: *mut Symbol = null;
+            if port->_type->IsClock() { fallback = this.current->clock; }
+            if port->_type->IsReset() { fallback = this.current->reset; }
+
+            if fallback == null {
+                this.Error("Missing connection for input " + Quote(port->name) + " of " + Quote(module->name) + ".", instance->span);
+                valid = false;
+                continue;
+            }
+
+            let path = this.MakePath(fallback->name, instance->span);
+            let connection = this.arena.New<ASTConnection>(port->name, path, instance->span);
+            connection->port = port;
+            this.CheckConnection(path, scope, port);
+            instance->connections.PushBack(connection);
+        }
+
+        symbol->_type = if valid { this.integer_type } else { this.error_type };
+    }
+
+    fn CheckConnection(&mut this, value: *mut ASTExpression, scope: *mut Scope, port: *mut Symbol) -> bool {
+        let _type = this.CheckExpression(value, scope, Context::Module, port->_type);
+        if _type->IsError() { return false; }
+
+        if port->_type->IsClock() {
+            if !_type->IsClock() {
+                this.Error("Port " + Quote(port->name) + " expects a clock, found " + Quote(_type->Describe()) + ".", value->span);
+                return false;
+            }
+
+            return true;
+        }
+
+        this.Coerce(value, port->_type)
+    }
+
+    fn MakePath(&mut this, name: &String, span: SourceSpan) -> *mut ASTPathExpression {
+        let path = this.arena.New<ASTPathExpression>(span);
+        path->segments.PushBack(name);
+        path
+    }
+
+    fn EvalConstant(&mut this, expression: *mut ASTExpression, scope: *mut Scope) -> Option<i64> {
+        match expression->kind {
+            ASTExpressionKind::Integer => Option<i64>::Some((expression as *mut ASTIntegerLiteral)->literal),
+            ASTExpressionKind::Boolean => Option<i64>::Some(if (expression as *mut ASTBooleanLiteral)->literal { 1 } else { 0 }),
+            ASTExpressionKind::Path => {
+                let path = expression as *mut ASTPathExpression;
+                let symbol = scope->Lookup(path->segments[0]);
+
+                if symbol == null {
+                    this.Error("Cannot find " + Quote(path->segments[0]) + " in this scope.", expression->span);
+                    return Option<i64>::None;
+                }
+
+                if path->segments.Length() == 1 && symbol->kind == SymbolKind::Constant {
+                    if !this.ResolveSymbol(symbol) { return Option<i64>::None; }
+                    return Option<i64>::Some(symbol->value);
+                }
+
+                if path->segments.Length() == 2 && symbol->kind == SymbolKind::Enumeration {
+                    if !this.ResolveSymbol(symbol) { return Option<i64>::None; }
+                    let index = symbol->enumeration->Find(path->segments[1]);
+
+                    if index < 0 {
+                        this.Error("Enum " + Quote(symbol->name) + " has no variant named " + Quote(path->segments[1]) + ".", expression->span);
+                        return Option<i64>::None;
+                    }
+
+                    return Option<i64>::Some(symbol->enumeration->values[index as usize]);
+                }
+
+                this.Error(Quote(path->ToString()) + " is not a constant.", expression->span);
+                Option<i64>::None
+            },
+            ASTExpressionKind::Unary => {
+                let unary = expression as *mut ASTUnaryExpression;
+
+                match this.EvalConstant(unary->operand, scope) {
+                    Option<i64>::Some(value) => Option<i64>::Some(if unary->op == ASTUnaryKind::Negate { -value } else { !value }),
+                    Option<i64>::None => Option<i64>::None
+                }
+            },
+            ASTExpressionKind::Binary => {
+                let binary = expression as *mut ASTBinaryExpression;
+                let left = match this.EvalConstant(binary->left, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return Option<i64>::None; } };
+                let right = match this.EvalConstant(binary->right, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return Option<i64>::None; } };
+                this.FoldInteger(binary->op, left, right, expression->span)
+            },
+            ASTExpressionKind::Call => {
+                let call = expression as *mut ASTCallExpression;
+
+                if call->name != "clog2" || call->arguments.Length() != 1 {
+                    this.Error("Only 'clog2(n)' can be called in a constant expression.", expression->span);
+                    return Option<i64>::None;
+                }
+
+                match this.EvalConstant(call->arguments[0], scope) {
+                    Option<i64>::Some(value) => Option<i64>::Some(Clog2(value)),
+                    Option<i64>::None => Option<i64>::None
+                }
+            },
+            ASTExpressionKind::Cast => {
+                let cast = expression as *mut ASTCastExpression;
+                let target = this.ResolveType(cast->target, scope);
+                if target->IsError() { return Option<i64>::None; }
+
+                match this.EvalConstant(cast->operand, scope) {
+                    Option<i64>::Some(value) => Option<i64>::Some(Wrap(value, target)),
+                    Option<i64>::None => Option<i64>::None
+                }
+            },
+            ASTExpressionKind::If => {
+                let conditional = expression as *mut ASTIfExpression;
+
+                match this.EvalConstant(conditional->condition, scope) {
+                    Option<i64>::Some(value) => this.EvalConstant(if value != 0 { conditional->then } else { conditional->otherwise }, scope),
+                    Option<i64>::None => Option<i64>::None
+                }
+            },
+            _ => {
+                this.Error("Expected a constant expression.", expression->span);
+                Option<i64>::None
+            }
+        }
+    }
+
+    fn FoldInteger(&mut this, op: ASTBinaryKind, left: i64, right: i64, span: SourceSpan) -> Option<i64> {
+        if (op == ASTBinaryKind::Divide || op == ASTBinaryKind::Modulo) && right == 0 {
+            this.Error("Division by zero in a constant expression.", span);
+            return Option<i64>::None;
+        }
+
+        if op.IsShift() && (right < 0 || right > 63) {
+            this.Error("Shift amount " + String::FromInteger(right) + " is out of range in a constant expression.", span);
+            return Option<i64>::None;
+        }
+
+        Option<i64>::Some(match op {
+            ASTBinaryKind::Add => left + right,
+            ASTBinaryKind::Subtract => left - right,
+            ASTBinaryKind::Multiply => left * right,
+            ASTBinaryKind::Divide => left / right,
+            ASTBinaryKind::Modulo => left % right,
+            ASTBinaryKind::BitwiseAnd => left & right,
+            ASTBinaryKind::BitwiseOr => left | right,
+            ASTBinaryKind::BitwiseXor => left ^ right,
+            ASTBinaryKind::LeftShift => left << right,
+            ASTBinaryKind::RightShift => left >> right,
+            ASTBinaryKind::Equal => if left == right { 1 } else { 0 },
+            ASTBinaryKind::NotEqual => if left != right { 1 } else { 0 },
+            ASTBinaryKind::Less => if left < right { 1 } else { 0 },
+            ASTBinaryKind::Greater => if left > right { 1 } else { 0 },
+            ASTBinaryKind::LessEqual => if left <= right { 1 } else { 0 },
+            ASTBinaryKind::GreaterEqual => if left >= right { 1 } else { 0 },
+            ASTBinaryKind::And => if left != 0 && right != 0 { 1 } else { 0 },
+            ASTBinaryKind::Or => if left != 0 || right != 0 { 1 } else { 0 }
+        })
+    }
+
+    fn SetConstant(&this, expression: *mut ASTExpression, _type: *mut Type, value: i64) -> *mut Type {
+        (expression->resolved, expression->constant, expression->value) = (_type, true, Wrap(value, _type));
+        _type
+    }
+
+    fn Fail(&this, expression: *mut ASTExpression) -> *mut Type {
+        expression->resolved = this.error_type;
+        this.error_type
+    }
+
+    fn Coerce(&mut this, expression: *mut ASTExpression, target: *mut Type) -> bool {
+        let actual = expression->resolved;
+        if actual == null || actual->IsError() || target->IsError() { return true; }
+
+        if actual->IsInteger() {
+            let bits = this.ValueType(target);
+
+            if bits->IsBits() {
+                if !Fits(expression->value, bits) {
+                    this.Error("Constant " + String::FromInteger(expression->value) + " does not fit in " + Quote(bits->Describe()) + ".", expression->span);
+                    return false;
+                }
+
+                expression->resolved = bits;
+                return true;
+            }
+
+            if target->IsEnum() {
+                this.Error("Expected " + Quote(target->Describe()) + ", found an integer; use a variant such as '" + target->enumeration->name + "::" + target->enumeration->names[0] + "'.", expression->span);
+                return false;
+            }
+
+            this.Error("Expected " + Quote(target->Describe()) + ", found an integer.", expression->span);
+            return false;
+        }
+
+        if SameType(actual, target) { return true; }
+        if (target->IsReset() && actual->IsBool()) || (target->IsBool() && actual->IsReset()) { return true; }
+
+        if target->IsBool() && actual->IsBits() {
+            this.Error("Mismatched types: expected 'bool', found " + Quote(actual->Describe()) + "; compare it instead, for example 'x != 0'.", expression->span);
+        } else if actual->IsBits() && target->IsBits() {
+            this.Error("Mismatched types: expected " + Quote(target->Describe()) + ", found " + Quote(actual->Describe()) + "; convert with 'as " + target->Describe() + "'.", expression->span);
+        } else {
+            this.Error("Mismatched types: expected " + Quote(target->Describe()) + ", found " + Quote(actual->Describe()) + ".", expression->span);
+        }
+
+        false
+    }
+
+    fn ExpectBool(&mut this, expression: *mut ASTExpression, scope: *mut Scope, context: Context) -> bool {
+        let _type = this.CheckExpression(expression, scope, context, this.bool_type);
+        if _type->IsError() { return false; }
+        if _type->IsBool() || _type->IsReset() { return true; }
+        if _type->IsInteger() { return this.Coerce(expression, this.bool_type); }
+
+        if _type->IsBits() {
+            this.Error("Expected 'bool', found " + Quote(_type->Describe()) + "; compare it instead, for example 'x != 0'.", expression->span);
+        } else {
+            this.Error("Expected 'bool', found " + Quote(_type->Describe()) + ".", expression->span);
+        }
+
+        false
+    }
+
+    fn Unify(&mut this, left: *mut ASTExpression, right: *mut ASTExpression, scope: *mut Scope, context: Context, expected: *mut Type, span: SourceSpan) -> *mut Type {
+        let mut hint = expected;
+        if hint != null && !hint->IsBits() && !hint->IsEnum() { hint = null; }
+        let left_type = this.ValueType(this.CheckExpression(left, scope, context, hint));
+        let right_type = this.ValueType(this.CheckExpression(right, scope, context, if left_type->IsInteger() || left_type->IsError() { hint } else { left_type }));
+        if left_type->IsError() || right_type->IsError() { return this.error_type; }
+
+        if left_type->IsInteger() && right_type->IsInteger() { return this.integer_type; }
+
+        if left_type->IsInteger() {
+            return if this.Coerce(left, right_type) { right_type } else { this.error_type };
+        }
+
+        if right_type->IsInteger() {
+            return if this.Coerce(right, left_type) { left_type } else { this.error_type };
+        }
+
+        if SameType(left_type, right_type) { return left_type; }
+
+        if left_type->IsBits() && right_type->IsBits() {
+            this.Error("Mismatched operand types " + Quote(left_type->Describe()) + " and " + Quote(right_type->Describe()) + "; convert one side with 'as'.", span);
+        } else {
+            this.Error("Mismatched operand types " + Quote(left_type->Describe()) + " and " + Quote(right_type->Describe()) + ".", span);
+        }
+
+        this.error_type
+    }
+
+    fn CheckExpression(&mut this, expression: *mut ASTExpression, scope: *mut Scope, context: Context, expected: *mut Type) -> *mut Type {
+        let result = this.CheckExpressionInner(expression, scope, context, expected);
+        if expression->resolved == null { expression->resolved = result; }
+        expression->resolved
+    }
+
+    fn CheckExpressionInner(&mut this, expression: *mut ASTExpression, scope: *mut Scope, context: Context, expected: *mut Type) -> *mut Type {
+        match expression->kind {
+            ASTExpressionKind::Integer => this.SetConstant(expression, this.integer_type, (expression as *mut ASTIntegerLiteral)->literal),
+            ASTExpressionKind::Boolean => this.SetConstant(expression, this.bool_type, if (expression as *mut ASTBooleanLiteral)->literal { 1 } else { 0 }),
+            ASTExpressionKind::Path => this.CheckPath(expression as *mut ASTPathExpression, scope),
+            ASTExpressionKind::Unary => this.CheckUnary(expression as *mut ASTUnaryExpression, scope, context, expected),
+            ASTExpressionKind::Binary => this.CheckBinary(expression as *mut ASTBinaryExpression, scope, context, expected),
+            ASTExpressionKind::Index => this.CheckIndex(expression as *mut ASTIndexExpression, scope, context),
+            ASTExpressionKind::Slice => this.CheckSlice(expression as *mut ASTSliceExpression, scope, context),
+            ASTExpressionKind::Member => this.CheckMember(expression as *mut ASTMemberExpression, scope),
+            ASTExpressionKind::Call => this.CheckCall(expression as *mut ASTCallExpression, scope, context),
+            ASTExpressionKind::Cast => this.CheckCast(expression as *mut ASTCastExpression, scope, context),
+            ASTExpressionKind::If => this.CheckIf(expression as *mut ASTIfExpression, scope, context, expected),
+            ASTExpressionKind::Instance => {
+                this.Error("Module instances are only allowed as the value of a 'let' at module level.", expression->span);
+                this.Fail(expression)
+            }
+        }
+    }
+
+    fn CheckPath(&mut this, path: *mut ASTPathExpression, scope: *mut Scope) -> *mut Type {
+        let name = path->segments[0];
+        let symbol = scope->Lookup(name);
+
+        if symbol == null {
+            this.Error("Cannot find " + Quote(name) + " in this scope.", path->span);
+            return this.Fail(path);
+        }
+
+        if path->segments.Length() > 2 {
+            this.Error("Invalid path " + Quote(path->ToString()) + ".", path->span);
+            return this.Fail(path);
+        }
+
+        if path->segments.Length() == 2 {
+            if symbol->kind != SymbolKind::Enumeration {
+                this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not an enum.", path->span);
+                return this.Fail(path);
+            }
+
+            if !this.ResolveSymbol(symbol) { return this.Fail(path); }
+            let info = symbol->enumeration;
+            let index = info->Find(path->segments[1]);
+
+            if index < 0 {
+                this.Error("Enum " + Quote(info->name) + " has no variant named " + Quote(path->segments[1]) + ".", path->span);
+                return this.Fail(path);
+            }
+
+            path->symbol = symbol;
+            return this.SetConstant(path, info->_type, info->values[index as usize]);
+        }
+
+        path->symbol = symbol;
+
+        match symbol->kind {
+            SymbolKind::Constant => {
+                if !this.ResolveSymbol(symbol) { return this.Fail(path); }
+                this.SetConstant(path, symbol->_type, symbol->value)
+            },
+            SymbolKind::Port | SymbolKind::Let | SymbolKind::Wire | SymbolKind::Register => {
+                if !this.ResolveSymbol(symbol) { return this.Fail(path); }
+                symbol->_type
+            },
+            SymbolKind::Instance => {
+                this.Error(Quote(name) + " is an instance; read one of its outputs with '" + name + ".<port>'.", path->span);
+                this.Fail(path)
+            },
+            _ => {
+                this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not a value.", path->span);
+                this.Fail(path)
+            }
+        }
+    }
+
+    fn CheckUnary(&mut this, unary: *mut ASTUnaryExpression, scope: *mut Scope, context: Context, expected: *mut Type) -> *mut Type {
+        let operand = this.ValueType(this.CheckExpression(unary->operand, scope, context, expected));
+        if operand->IsError() { return this.Fail(unary); }
+
+        if operand->IsInteger() {
+            let value = unary->operand->value;
+            return this.SetConstant(unary, this.integer_type, if unary->op == ASTUnaryKind::Negate { -value } else { !value });
+        }
+
+        if !operand->IsBits() {
+            this.Error("Cannot apply '".ToString() + (if unary->op == ASTUnaryKind::Negate { "-" } else { "!" }) + "' to " + Quote(operand->Describe()) + ".", unary->span);
+            return this.Fail(unary);
+        }
+
+        if unary->op == ASTUnaryKind::Negate && operand->IsBool() {
+            this.Error("Cannot negate a 'bool'; use '!' for logical not.", unary->span);
+            return this.Fail(unary);
+        }
+
+        if unary->operand->constant {
+            let value = unary->operand->value;
+            return this.SetConstant(unary, operand, if unary->op == ASTUnaryKind::Negate { -value } else { !value });
+        }
+
+        operand
+    }
+
+    fn CheckBinary(&mut this, binary: *mut ASTBinaryExpression, scope: *mut Scope, context: Context, expected: *mut Type) -> *mut Type {
+        let op = binary->op;
+
+        if op.IsLogical() {
+            let left = this.ExpectBool(binary->left, scope, context);
+            let right = this.ExpectBool(binary->right, scope, context);
+            if !left || !right { return this.Fail(binary); }
+
+            if binary->left->constant && binary->right->constant {
+                let value = this.FoldInteger(op, binary->left->value, binary->right->value, binary->span).Unwrap();
+                return this.SetConstant(binary, this.bool_type, value);
+            }
+
+            return this.bool_type;
+        }
+
+        if op.IsShift() {
+            let left = this.ValueType(this.CheckExpression(binary->left, scope, context, expected));
+            let right = this.ValueType(this.CheckExpression(binary->right, scope, context, null));
+            if left->IsError() || right->IsError() { return this.Fail(binary); }
+
+            if right->IsInteger() {
+                if binary->right->value < 0 {
+                    this.Error("Shift amount cannot be negative.", binary->right->span);
+                    return this.Fail(binary);
+                }
+            } else if !right->IsBits() || right->signed {
+                this.Error("Shift amount must be unsigned, found " + Quote(right->Describe()) + ".", binary->right->span);
+                return this.Fail(binary);
+            }
+
+            let mut result = left;
+
+            if left->IsInteger() {
+                if right->IsInteger() {
+                    return match this.FoldInteger(op, binary->left->value, binary->right->value, binary->span) {
+                        Option<i64>::Some(value) => this.SetConstant(binary, this.integer_type, value),
+                        Option<i64>::None => this.Fail(binary)
+                    };
+                }
+
+                if expected == null || !this.ValueType(expected)->IsBits() {
+                    this.Error("Cannot infer the width of the shifted constant; write it as '(" + String::FromInteger(binary->left->value) + " as u8)' with the width you need.", binary->left->span);
+                    return this.Fail(binary);
+                }
+
+                result = this.ValueType(expected);
+                if !this.Coerce(binary->left, result) { return this.Fail(binary); }
+            } else if !left->IsBits() {
+                this.Error("Cannot shift a value of type " + Quote(left->Describe()) + ".", binary->left->span);
+                return this.Fail(binary);
+            }
+
+            if binary->left->constant && binary->right->constant && binary->right->value < 64 {
+                let value = if op == ASTBinaryKind::LeftShift { binary->left->value << binary->right->value } else { binary->left->value >> binary->right->value };
+                return this.SetConstant(binary, result, value);
+            }
+
+            return result;
+        }
+
+        let operands = this.Unify(binary->left, binary->right, scope, context, if op.IsComparison() { null } else { expected }, binary->span);
+        if operands->IsError() { return this.Fail(binary); }
+
+        if operands->IsEnum() && op != ASTBinaryKind::Equal && op != ASTBinaryKind::NotEqual {
+            this.Error("Enums can only be compared with '==' and '!='.", binary->span);
+            return this.Fail(binary);
+        }
+
+        if !operands->IsInteger() && !operands->IsBits() && !operands->IsEnum() {
+            this.Error("Operator '" + op.Text() + "' cannot be used with " + Quote(operands->Describe()) + ".", binary->span);
+            return this.Fail(binary);
+        }
+
+        let arithmetic = op == ASTBinaryKind::Add || op == ASTBinaryKind::Subtract || op == ASTBinaryKind::Multiply || op == ASTBinaryKind::Divide || op == ASTBinaryKind::Modulo;
+
+        if arithmetic && operands->IsBool() {
+            this.Error("Arithmetic on 'bool' is not allowed; use '&', '|' or '^' instead.", binary->span);
+            return this.Fail(binary);
+        }
+
+        let result = if op.IsComparison() { this.bool_type } else { operands };
+
+        if binary->left->constant && binary->right->constant {
+            return match this.FoldInteger(op, binary->left->value, binary->right->value, binary->span) {
+                Option<i64>::Some(value) => this.SetConstant(binary, result, value),
+                Option<i64>::None => this.Fail(binary)
+            };
+        }
+
+        result
+    }
+
+    fn CheckIndexValue(&mut this, index: *mut ASTExpression, scope: *mut Scope, context: Context, limit: i64) -> bool {
+        let _type = this.ValueType(this.CheckExpression(index, scope, context, null));
+        if _type->IsError() { return false; }
+
+        if _type->IsInteger() {
+            if index->value < 0 || index->value >= limit {
+                this.Error("Index " + String::FromInteger(index->value) + " is out of range for a size of " + String::FromInteger(limit) + ".", index->span);
+                return false;
+            }
+
+            return true;
+        }
+
+        if !_type->IsBits() || _type->signed {
+            this.Error("Index must be unsigned, found " + Quote(_type->Describe()) + ".", index->span);
+            return false;
+        }
+
+        true
+    }
+
+    fn CheckIndex(&mut this, index: *mut ASTIndexExpression, scope: *mut Scope, context: Context) -> *mut Type {
+        let base = this.CheckExpression(index->base, scope, context, null);
+        if base->IsError() { return this.Fail(index); }
+
+        if base->IsArray() {
+            if !this.CheckIndexValue(index->index, scope, context, base->length as i64) { return this.Fail(index); }
+            return base->element;
+        }
+
+        if !base->IsBits() {
+            this.Error("Cannot index a value of type " + Quote(base->Describe()) + ".", index->base->span);
+            return this.Fail(index);
+        }
+
+        if !this.CheckIndexValue(index->index, scope, context, base->width as i64) { return this.Fail(index); }
+        this.bool_type
+    }
+
+    fn CheckSlice(&mut this, slice: *mut ASTSliceExpression, scope: *mut Scope, context: Context) -> *mut Type {
+        let base = this.CheckExpression(slice->base, scope, context, null);
+        if base->IsError() { return this.Fail(slice); }
+
+        if !base->IsBits() {
+            this.Error("Cannot slice a value of type " + Quote(base->Describe()) + ".", slice->base->span);
+            return this.Fail(slice);
+        }
+
+        let high = match this.EvalConstant(slice->high, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return this.Fail(slice); } };
+        let low = match this.EvalConstant(slice->low, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return this.Fail(slice); } };
+
+        if low < 0 || high < low || high >= base->width as i64 {
+            this.Error("Slice [" + String::FromInteger(high) + ":" + String::FromInteger(low) + "] is out of range for " + Quote(base->Describe()) + ".", slice->span);
+            return this.Fail(slice);
+        }
+
+        (slice->high_value, slice->low_value) = (high, low);
+        this.MakeBits((high - low + 1) as u32, false)
+    }
+
+    fn CheckMember(&mut this, member: *mut ASTMemberExpression, scope: *mut Scope) -> *mut Type {
+        let base = member->base;
+
+        if base->kind != ASTExpressionKind::Path || (base as *mut ASTPathExpression)->segments.Length() != 1 {
+            this.Error("Only instance outputs can be accessed with '.'.", member->span);
+            return this.Fail(member);
+        }
+
+        let name = (base as *mut ASTPathExpression)->segments[0];
+        let symbol = scope->Lookup(name);
+
+        if symbol == null {
+            this.Error("Cannot find " + Quote(name) + " in this scope.", base->span);
+            return this.Fail(member);
+        }
+
+        if symbol->kind != SymbolKind::Instance {
+            this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not an instance.", base->span);
+            return this.Fail(member);
+        }
+
+        let module = this.InstanceModule(symbol);
+        if module == null { return this.Fail(member); }
+        let port = module->FindPort(member->name);
+
+        if port == null {
+            this.Error("Module " + Quote(module->name) + " has no port named " + Quote(member->name) + ".", member->span);
+            return this.Fail(member);
+        }
+
+        if port->input {
+            this.Error(Quote(member->name) + " is an input of " + Quote(module->name) + "; only outputs can be read.", member->span);
+            return this.Fail(member);
+        }
+
+        (member->instance, member->port) = (symbol, port);
+        base->resolved = this.error_type;
+        port->_type
+    }
+
+    fn CheckCall(&mut this, call: *mut ASTCallExpression, scope: *mut Scope, context: Context) -> *mut Type {
+        let name = call->name;
+        let count = call->arguments.Length();
+
+        if name == "clog2" {
+            return match this.EvalConstant(call, scope) {
+                Option<i64>::Some(value) => this.SetConstant(call, this.integer_type, value),
+                Option<i64>::None => this.Fail(call)
+            };
+        }
+
+        if name == "cat" {
+            if count == 0 {
+                this.Error("'cat' needs at least one argument.", call->span);
+                return this.Fail(call);
+            }
+
+            let mut width: i64 = 0;
+            let mut valid = true;
+
+            for argument in call->arguments {
+                let _type = this.ValueType(this.CheckExpression(argument, scope, context, null));
+
+                if _type->IsError() {
+                    valid = false;
+                } else if _type->IsInteger() {
+                    this.Error("Constants in 'cat' need an explicit width, for example '" + String::FromInteger(argument->value) + " as u4'.", argument->span);
+                    valid = false;
+                } else if !_type->IsBits() {
+                    this.Error("Cannot concatenate a value of type " + Quote(_type->Describe()) + ".", argument->span);
+                    valid = false;
+                } else {
+                    width += _type->width as i64;
+                }
+            }
+
+            if !valid { return this.Fail(call); }
+
+            if width > MAX_WIDTH {
+                this.Error("Concatenation is wider than " + String::FromInteger(MAX_WIDTH) + " bits.", call->span);
+                return this.Fail(call);
+            }
+
+            return this.MakeBits(width as u32, false);
+        }
+
+        if name == "rep" {
+            if count != 2 {
+                this.Error("'rep' takes a count and a value, for example 'rep(4, bit)'.", call->span);
+                return this.Fail(call);
+            }
+
+            let times = match this.EvalConstant(call->arguments[0], scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return this.Fail(call); } };
+            this.SetConstant(call->arguments[0], this.integer_type, times);
+            let _type = this.ValueType(this.CheckExpression(call->arguments[1], scope, context, null));
+            if _type->IsError() { return this.Fail(call); }
+
+            if !_type->IsBits() {
+                this.Error("'rep' needs a bit vector with a known width, found " + Quote(_type->Describe()) + ".", call->arguments[1]->span);
+                return this.Fail(call);
+            }
+
+            if times < 1 || times * (_type->width as i64) > MAX_WIDTH {
+                this.Error("Invalid repetition count " + String::FromInteger(times) + ".", call->arguments[0]->span);
+                return this.Fail(call);
+            }
+
+            return this.MakeBits((times * (_type->width as i64)) as u32, false);
+        }
+
+        if name == "any" || name == "all" || name == "parity" {
+            if count != 1 {
+                this.Error(Quote(name) + " takes exactly one argument.", call->span);
+                return this.Fail(call);
+            }
+
+            let _type = this.ValueType(this.CheckExpression(call->arguments[0], scope, context, null));
+            if _type->IsError() { return this.Fail(call); }
+
+            if !_type->IsBits() {
+                this.Error(Quote(name) + " needs a bit vector, found " + Quote(_type->Describe()) + ".", call->arguments[0]->span);
+                return this.Fail(call);
+            }
+
+            return this.bool_type;
+        }
+
+        this.Error("Unknown function " + Quote(name) + ".", call->span);
+        this.Fail(call)
+    }
+
+    fn CheckCast(&mut this, cast: *mut ASTCastExpression, scope: *mut Scope, context: Context) -> *mut Type {
+        let target = this.ResolveType(cast->target, scope);
+        let source = this.ValueType(this.CheckExpression(cast->operand, scope, context, null));
+        if target->IsError() || source->IsError() { return this.Fail(cast); }
+
+        if target->IsEnum() {
+            let info = target->enumeration;
+
+            if source->IsInteger() {
+                if info->FindValue(cast->operand->value) < 0 {
+                    this.Error(String::FromInteger(cast->operand->value) + " is not a value of " + Quote(info->name) + ".", cast->operand->span);
+                    return this.Fail(cast);
+                }
+
+                return this.SetConstant(cast, target, cast->operand->value);
+            }
+
+            if !source->IsBits() || source->signed || source->width != info->width {
+                this.Error("Only a 'u" + String::FromInteger(info->width as u64) + "' can be cast to " + Quote(info->name) + ", found " + Quote(source->Describe()) + ".", cast->operand->span);
+                return this.Fail(cast);
+            }
+
+            return target;
+        }
+
+        if !target->IsBits() {
+            this.Error("Cannot cast to " + Quote(target->Describe()) + ".", cast->target->span);
+            return this.Fail(cast);
+        }
+
+        if !source->IsInteger() && !source->IsBits() && !source->IsEnum() {
+            this.Error("Cannot cast a value of type " + Quote(source->Describe()) + ".", cast->operand->span);
+            return this.Fail(cast);
+        }
+
+        if cast->operand->constant {
+            return this.SetConstant(cast, target, cast->operand->value);
+        }
+
+        target
+    }
+
+    fn CheckIf(&mut this, conditional: *mut ASTIfExpression, scope: *mut Scope, context: Context, expected: *mut Type) -> *mut Type {
+        let condition = this.ExpectBool(conditional->condition, scope, context);
+        let result = this.Unify(conditional->then, conditional->otherwise, scope, context, expected, conditional->span);
+        if !condition || result->IsError() { return this.Fail(conditional); }
+
+        if result->IsInteger() && !conditional->condition->constant {
+            if expected == null || !this.ValueType(expected)->IsBits() {
+                this.Error("Cannot infer the width of this 'if' expression; give one branch an explicit type with 'as'.", conditional->span);
+                return this.Fail(conditional);
+            }
+
+            let bits = this.ValueType(expected);
+            if !this.Coerce(conditional->then, bits) || !this.Coerce(conditional->otherwise, bits) { return this.Fail(conditional); }
+            return bits;
+        }
+
+        if conditional->condition->constant {
+            let chosen = if conditional->condition->value != 0 { conditional->then } else { conditional->otherwise };
+            if chosen->constant { return this.SetConstant(conditional, result, chosen->value); }
+        }
+
+        result
+    }
+
+    pub fn Check(&mut this, files: &Vector<*mut ASTFile>) {
+        for file in files {
+            for item in file->items {
+                this.Declare(item, this.global, null);
+            }
+        }
+
+        for file in files {
+            for item in file->items {
+                match item->kind {
+                    ASTItemKind::Const => { this.ResolveSymbol((item as *mut ASTConstItem)->symbol); },
+                    ASTItemKind::Type => { this.ResolveSymbol((item as *mut ASTTypeItem)->symbol); },
+                    ASTItemKind::Enum => { this.ResolveSymbol((item as *mut ASTEnumItem)->symbol); },
+                    ASTItemKind::Module => { this.ResolveSymbol((item as *mut ASTModuleItem)->info->symbol); },
+                    _ => {}
+                }
+            }
+        }
+
+        for module in this.modules {
+            if !module->item->external && module->ports_resolved {
+                this.CheckModule(module);
+            }
+        }
+    }
+
+    fn CheckModule(&mut this, module: *mut ModuleInfo) {
+        this.current = module;
+        let scope = module->scope;
+        let item = module->item;
+
+        for child in item->items {
+            this.Declare(child, scope, module);
+        }
+
+        for port in module->ports {
+            if port->init == null { continue; }
+
+            if !port->registered {
+                this.Error("Only 'out reg' ports can have an initial value.", port->init->span);
+                continue;
+            }
+
+            if !port->_type->IsError() {
+                this.CheckInitial(port->init, scope, port->_type);
+            }
+        }
+
+        for child in item->items {
+            match child->kind {
+                ASTItemKind::Const => { this.ResolveSymbol((child as *mut ASTConstItem)->symbol); },
+                ASTItemKind::Type => { this.ResolveSymbol((child as *mut ASTTypeItem)->symbol); },
+                ASTItemKind::Enum => { this.ResolveSymbol((child as *mut ASTEnumItem)->symbol); },
+                ASTItemKind::Signal => { this.ResolveSymbol((child as *mut ASTSignalItem)->symbol); },
+                _ => {}
+            }
+        }
+
+        for child in item->items {
+            match child->kind {
+                ASTItemKind::Assign => this.CheckAssignItem(child as *mut ASTAssignItem, scope),
+                ASTItemKind::Comb => this.CheckComb(child as *mut ASTCombItem, scope),
+                ASTItemKind::Seq => this.CheckSeq(child as *mut ASTSeqItem, scope),
+                _ => {}
+            }
+        }
+
+        let mut symbols = module->ports;
+        symbols += module->signals;
+
+        for symbol in symbols {
+            if symbol->driver != DriverKind::None || symbol->_type == null || symbol->_type->IsError() { continue; }
+
+            if symbol->kind == SymbolKind::Port && symbol->output {
+                if symbol->registered {
+                    this.Error("Output " + Quote(symbol->name) + " is never assigned; assign it in a 'seq' block.", symbol->span);
+                } else {
+                    this.Error("Output " + Quote(symbol->name) + " is never driven.", symbol->span);
+                }
+            } else if symbol->kind == SymbolKind::Wire {
+                this.Error("Wire " + Quote(symbol->name) + " is never driven.", symbol->span);
+            } else if symbol->kind == SymbolKind::Register {
+                this.Error("Register " + Quote(symbol->name) + " is never assigned; assign it in a 'seq' block or make it a 'const'.", symbol->span);
+            }
+        }
+
+        this.current = null;
+    }
+
+    fn RecordDriver(&mut this, symbol: *mut Symbol, kind: DriverKind, node: *mut ASTNode, span: SourceSpan) {
+        if symbol->driver == DriverKind::None {
+            (symbol->driver, symbol->driver_node, symbol->driver_span) = (kind, node, span);
+            return;
+        }
+
+        if symbol->driver == kind && symbol->driver_node == node { return; }
+        this.Error(Quote(symbol->name) + " is already driven elsewhere; a signal can only have one driver.", span);
+        this.Note("It is first driven here.", symbol->driver_span);
+    }
+
+    fn CheckAssignItem(&mut this, item: *mut ASTAssignItem, scope: *mut Scope) {
+        let target = item->target;
+
+        if target->kind != ASTExpressionKind::Path || (target as *mut ASTPathExpression)->segments.Length() != 1 {
+            this.Error("Continuous assignments must assign a whole wire or output; partial assignments are only allowed in 'seq' blocks.", target->span);
+            return;
+        }
+
+        let symbol = this.CheckTargetSymbol(target as *mut ASTPathExpression, scope, Context::Module);
+        if symbol == null { return; }
+        item->symbol = symbol;
+        this.RecordDriver(symbol, DriverKind::Assign, item, item->span);
+        this.CheckExpression(item->value, scope, Context::Module, symbol->_type);
+        this.Coerce(item->value, symbol->_type);
+    }
+
+    fn CheckTargetSymbol(&mut this, path: *mut ASTPathExpression, scope: *mut Scope, context: Context) -> *mut Symbol {
+        let name = path->segments[0];
+        let symbol = scope->Lookup(name);
+
+        if symbol == null || path->segments.Length() != 1 {
+            this.Error("Cannot find " + Quote(path->ToString()) + " in this scope.", path->span);
+            return null;
+        }
+
+        if !symbol->IsSignal() {
+            this.Error("Cannot assign to " + Quote(name) + ", which is a " + symbol->kind.Describe() + ".", path->span);
+            return null;
+        }
+
+        if !this.ResolveSymbol(symbol) { return null; }
+        path->symbol = symbol;
+        path->resolved = symbol->_type;
+
+        if symbol->kind == SymbolKind::Port && symbol->input {
+            this.Error("Cannot assign to input " + Quote(name) + ".", path->span);
+            return null;
+        }
+
+        if symbol->kind == SymbolKind::Let {
+            this.Error(Quote(name) + " is declared with 'let' and already has a value; declare it with 'wire' to drive it separately.", path->span);
+            return null;
+        }
+
+        if context == Context::Seq {
+            if !symbol->registered {
+                this.Error(Quote(name) + " is not a register; only 'reg' signals and 'out reg' ports can be assigned in 'seq' blocks.", path->span);
+                return null;
+            }
+        } else if symbol->registered {
+            this.Error(Quote(name) + " is a register; assign it in a 'seq' block with '<-'.", path->span);
+            return null;
+        }
+
+        symbol
+    }
+
+    fn CheckTarget(&mut this, target: *mut ASTExpression, scope: *mut Scope, context: Context) -> *mut Symbol {
+        match target->kind {
+            ASTExpressionKind::Path => this.CheckTargetSymbol(target as *mut ASTPathExpression, scope, context),
+            ASTExpressionKind::Index | ASTExpressionKind::Slice => {
+                if context != Context::Seq {
+                    this.Error("Partial assignments are only supported in 'seq' blocks for now.", target->span);
+                    return null;
+                }
+
+                let base = if target->kind == ASTExpressionKind::Index { (target as *mut ASTIndexExpression)->base } else { (target as *mut ASTSliceExpression)->base };
+                let symbol = this.CheckTarget(base, scope, context);
+                if symbol == null { return null; }
+                if this.CheckExpression(target, scope, context, null)->IsError() { return null; }
+                symbol
+            },
+            _ => {
+                this.Error("Invalid assignment target.", target->span);
+                null
+            }
+        }
+    }
+
+    fn CheckComb(&mut this, item: *mut ASTCombItem, scope: *mut Scope) {
+        this.block = item;
+        this.CheckStatement(item->body, scope, Context::Comb);
+        let mut assigned = Vector<*mut Symbol>();
+        this.CollectAssigned(item->body, assigned);
+        let definite = this.Definite(item->body);
+
+        for symbol in assigned {
+            if !definite.Contains(symbol) {
+                this.Error(Quote(symbol->name) + " is not assigned on every path through this 'comb' block, which would infer a latch; give it a default value at the start of the block.", item->span);
+            }
+        }
+
+        this.block = null;
+    }
+
+    fn CheckSeq(&mut this, item: *mut ASTSeqItem, scope: *mut Scope) {
+        this.block = item;
+
+        if item->clock == null {
+            if this.current->clock == null {
+                this.Error("Module " + Quote(this.current->name) + " has no clock input; add a 'clock' port or name one with 'seq(clk)'.", item->span);
+            } else {
+                item->clock = this.MakePath(this.current->clock->name, item->span);
+                if this.current->reset != null { item->reset = this.MakePath(this.current->reset->name, item->span); }
+            }
+        }
+
+        if item->clock != null {
+            let clock = this.CheckExpression(item->clock, scope, Context::Module, null);
+
+            if !clock->IsError() && !clock->IsClock() {
+                this.Error("Expected a clock, found " + Quote(clock->Describe()) + ".", item->clock->span);
+            }
+        }
+
+        if item->reset != null {
+            let reset = this.CheckExpression(item->reset, scope, Context::Module, null);
+
+            if !reset->IsError() && !reset->IsReset() && !reset->IsBool() {
+                this.Error("Expected a reset, found " + Quote(reset->Describe()) + ".", item->reset->span);
+            }
+        }
+
+        this.CheckStatement(item->body, scope, Context::Seq);
+        let mut symbols = this.current->ports;
+        symbols += this.current->signals;
+
+        for symbol in symbols {
+            if symbol->driver_node != item as *mut ASTNode || symbol->init == null { continue; }
+
+            if item->reset != null {
+                item->registers.PushBack(symbol);
+            } else {
+                symbol->power_on = true;
+            }
+        }
+
+        this.block = null;
+    }
+
+    fn CheckStatement(&mut this, statement: *mut ASTStatement, scope: *mut Scope, context: Context) {
+        match statement->kind {
+            ASTStatementKind::Block => {
+                for child in (statement as *mut ASTBlockStatement)->statements {
+                    this.CheckStatement(child, scope, context);
+                }
+            },
+            ASTStatementKind::Assign => this.CheckAssign(statement as *mut ASTAssignStatement, scope, context),
+            ASTStatementKind::If => {
+                let conditional = statement as *mut ASTIfStatement;
+                this.ExpectBool(conditional->condition, scope, context);
+                this.CheckStatement(conditional->then, scope, context);
+                if conditional->otherwise != null { this.CheckStatement(conditional->otherwise, scope, context); }
+            },
+            ASTStatementKind::Match => this.CheckMatch(statement as *mut ASTMatchStatement, scope, context)
+        }
+    }
+
+    fn CheckAssign(&mut this, statement: *mut ASTAssignStatement, scope: *mut Scope, context: Context) {
+        if context == Context::Comb && statement->nonblocking {
+            this.Error("Use '=' in 'comb' blocks; '<-' is for 'seq' blocks.", statement->span);
+        }
+
+        if context == Context::Seq && !statement->nonblocking {
+            this.Error("Use '<-' in 'seq' blocks; '=' is for 'comb' blocks and continuous assignments.", statement->span);
+        }
+
+        let symbol = this.CheckTarget(statement->target, scope, context);
+        if symbol == null { return; }
+        (statement->symbol, statement->whole) = (symbol, statement->target->kind == ASTExpressionKind::Path);
+        this.RecordDriver(symbol, if context == Context::Comb { DriverKind::Comb } else { DriverKind::Seq }, this.block, statement->span);
+        let target = statement->target->resolved;
+        if target == null || target->IsError() { return; }
+
+        if target->IsArray() {
+            this.Error("Cannot assign a whole memory; assign one element at a time.", statement->target->span);
+            return;
+        }
+
+        this.CheckExpression(statement->value, scope, context, target);
+        this.Coerce(statement->value, target);
+    }
+
+    fn CheckMatch(&mut this, statement: *mut ASTMatchStatement, scope: *mut Scope, context: Context) {
+        let _type = this.CheckExpression(statement->scrutinee, scope, context, null);
+        if _type->IsError() { return; }
+
+        if !_type->IsBits() && !_type->IsEnum() {
+            this.Error("Cannot match on a value of type " + Quote(_type->Describe()) + ".", statement->scrutinee->span);
+            return;
+        }
+
+        let mut covered = Vector<i64>();
+        let mut wildcard = false;
+
+        for arm in statement->arms {
+            if wildcard {
+                this.Error("This arm is unreachable because an earlier arm uses '_'.", arm->span);
+            }
+
+            for pattern in arm->patterns {
+                let pattern_type = this.CheckExpression(pattern, scope, context, _type);
+                if pattern_type->IsError() { continue; }
+
+                if !pattern->constant {
+                    this.Error("Match patterns must be constants.", pattern->span);
+                    continue;
+                }
+
+                if !this.Coerce(pattern, _type) { continue; }
+
+                if covered.Contains(pattern->value) {
+                    this.Error("This pattern is unreachable because its value is already matched.", pattern->span);
+                    continue;
+                }
+
+                covered.PushBack(pattern->value);
+            }
+
+            if arm->wildcard { wildcard = true; }
+            this.CheckStatement(arm->body, scope, context);
+        }
+
+        if wildcard {
+            statement->exhaustive = true;
+        } else if _type->IsEnum() {
+            statement->exhaustive = covered.Length() == _type->enumeration->values.Length();
+        } else if _type->width < 20 {
+            statement->exhaustive = covered.Length() as i64 == ((1 as i64) << (_type->width as i64));
+        }
+    }
+
+    fn CollectAssigned(&this, statement: *mut ASTStatement, result: &mut Vector<*mut Symbol>) {
+        match statement->kind {
+            ASTStatementKind::Block => {
+                for child in (statement as *mut ASTBlockStatement)->statements { this.CollectAssigned(child, result); }
+            },
+            ASTStatementKind::Assign => {
+                let symbol = (statement as *mut ASTAssignStatement)->symbol;
+                if symbol != null && !result.Contains(symbol) { result.PushBack(symbol); }
+            },
+            ASTStatementKind::If => {
+                let conditional = statement as *mut ASTIfStatement;
+                this.CollectAssigned(conditional->then, result);
+                if conditional->otherwise != null { this.CollectAssigned(conditional->otherwise, result); }
+            },
+            ASTStatementKind::Match => {
+                for arm in (statement as *mut ASTMatchStatement)->arms { this.CollectAssigned(arm->body, result); }
+            }
+        }
+    }
+
+    fn Definite(&this, statement: *mut ASTStatement) -> Vector<*mut Symbol> {
+        match statement->kind {
+            ASTStatementKind::Block => {
+                let mut result = Vector<*mut Symbol>();
+
+                for child in (statement as *mut ASTBlockStatement)->statements {
+                    result = Union(result, this.Definite(child));
+                }
+
+                result
+            },
+            ASTStatementKind::Assign => {
+                let assign = statement as *mut ASTAssignStatement;
+                let mut result = Vector<*mut Symbol>();
+                if assign->symbol != null && assign->whole { result.PushBack(assign->symbol); }
+                result
+            },
+            ASTStatementKind::If => {
+                let conditional = statement as *mut ASTIfStatement;
+                if conditional->otherwise == null { return Vector<*mut Symbol>(); }
+                Intersect(this.Definite(conditional->then), this.Definite(conditional->otherwise))
+            },
+            ASTStatementKind::Match => {
+                let matching = statement as *mut ASTMatchStatement;
+                if !matching->exhaustive || matching->arms.Empty() { return Vector<*mut Symbol>(); }
+                let mut result = this.Definite(matching->arms[0]->body);
+
+                for i in 1..matching->arms.Length() {
+                    result = Intersect(result, this.Definite(matching->arms[i]->body));
+                }
+
+                result
+            }
+        }
+    }
+}

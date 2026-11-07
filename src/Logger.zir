@@ -1,0 +1,249 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/mem", "std/std" : *]
+
+#[include "src/Source.zir" : *]
+
+#[if WINDOWS]
+class SYMBOL_INFO {
+    pub SizeOfStruct: u32,
+    pub TypeIndex: u32,
+    pub Reserved: [u64; 2],
+    pub Index: u32,
+    pub Size: u32,
+    pub ModBase: u64,
+    pub Flags: u32,
+    pub Value: u64,
+    pub Address: u64,
+    pub Register: u32,
+    pub Scope: u32,
+    pub Tag: u32,
+    pub NameLen: u32,
+    pub MaxNameLen: u32,
+    pub Name: [i8; 256]
+}
+
+class IMAGEHLP_MODULE64 {
+    pub SizeOfStruct: u32,
+    pub BaseOfImage: u64,
+    pub ImageSize: u32,
+    pub TimeDateStamp: u32,
+    pub CheckSum: u32,
+    pub NumSyms: u32,
+    pub SymType: i32,
+    pub ModuleName: [i8; 32],
+    pub ImageName: [i8; 256],
+    pub LoadedImageName: [i8; 256]
+}
+
+extern "C" {
+    fn GetCurrentProcess() -> *mut void;
+    fn RtlCaptureStackBackTrace(FramesToSkip: u32, FramesToCapture: u32, BackTrace: *mut *mut void, BackTraceHash: *mut u32) -> u16;
+    fn SymInitialize(hProcess: *mut void, UserSearchPath: *i8, fInvadeProcess: i32) -> i32;
+    fn SymFromAddr(hProcess: *mut void, Address: u64, Displacement: *mut u64, Symbol: *mut SYMBOL_INFO) -> i32;
+    fn SymGetModuleInfo64(hProcess: *mut void, dwAddr: u64, ModuleInfo: *mut IMAGEHLP_MODULE64) -> i32;
+}
+
+static mut sym_initialized: bool = false;
+#[endif]
+
+fn StackDump() {
+#[if WINDOWS]
+    let mut backtrace: [*mut void; 64];
+    let frames = RtlCaptureStackBackTrace(2, 62, &mut backtrace[0], null);
+    let longest = String::FromInteger((frames - 1) as i64).Length();
+    let process = GetCurrentProcess();
+
+    if !sym_initialized {
+        SymInitialize(process, null, 1);
+        sym_initialized = true;
+    }
+
+    let mut symbol: SYMBOL_INFO;
+    memset(&mut symbol, 0, sizeof(symbol));
+    symbol.SizeOfStruct = 88;
+    symbol.MaxNameLen = 255;
+
+    let mut module: IMAGEHLP_MODULE64;
+    memset(&mut module, 0, sizeof(module));
+    module.SizeOfStruct = sizeof(module) as u32;
+
+    for i in 0..frames {
+        let address = backtrace[i as usize] as u64;
+        let mut line = String();
+
+        let index_string = String::FromInteger(i as u64);
+        for j in 0..(longest - index_string.Length()) { line += " "; }
+        line += "#" + index_string + " 0x";
+
+        let address_string = String::FromInteger(address, 16).ToLower();
+        for j in 0..(16 - address_string.Length()) { line += '0'; }
+        line += address_string;
+
+        if SymFromAddr(process, address, null, &mut symbol) != 0 {
+            line += " " + String(&symbol.Name[0] as *i8);
+        }
+
+        if SymGetModuleInfo64(process, address, &mut module) != 0 {
+            line += " (" + String(&module.ImageName[0] as *i8) + "+0x" + String::FromInteger(address - module.BaseOfImage, 16).ToLower() + ")";
+        }
+
+        WriteLine(line);
+    }
+#[endif]
+}
+
+enum LogSeverity: i32 {
+    Info, Warning, Error, Fatal
+}
+
+class Log {
+    pub file: String,
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+    pub message: String,
+    pub severity: LogSeverity
+}
+
+class Logger {
+    pub logs: Vector<Log>,
+    has_error: bool = false,
+    executable: String;
+
+    Logger(&mut this, executable: &String) {
+        (logger, this.executable) = (this, executable);
+    }
+
+    ~Logger(&mut this) {
+        logger = null;
+    }
+
+    pub fn Log(file: *i8, start_row: u32, start_column: u32, end_row: u32, end_column: u32, message: *i8, severity: LogSeverity) {
+        let mut log: Log;
+        log.start = (start_row, start_column);
+        log.end = (end_row, end_column);
+        (log.file, log.severity) = (file, severity);
+        log.message += file;
+        log.message += ":";
+
+        if start_row != -1 as u32 {
+            log.message += String::FromInteger(start_row as HostUnsigned);
+            log.message += ":";
+        }
+
+        if start_column != -1 as u32 {
+            log.message += String::FromInteger(start_column as HostUnsigned);
+            log.message += ":";
+        }
+
+        match severity {
+            LogSeverity::Info => {
+                log.message += " \x1b[36mInfo:\x1b[0m ";
+            },
+            LogSeverity::Warning => {
+                log.message += " \x1b[35mWarning:\x1b[0m ";
+            },
+            LogSeverity::Error => {
+                log.message += " \x1b[31mError:\x1b[0m ";
+                logger->has_error = true;
+            },
+            LogSeverity::Fatal => {
+                log.message += " \x1b[31mFatal Error:\x1b[0m ";
+                logger->has_error = true;
+            }
+        }
+
+        log.message += message;
+        logger->logs.PushBack(log);
+        WriteLine(log.message);
+
+        if severity == LogSeverity::Fatal {
+            StackDump();
+            Exit(1);
+        }
+    }
+
+    pub fn Log(message: &String, severity: LogSeverity) {
+        Logger::Log(logger->executable.Data(), -1 as u32, -1 as u32, -1 as u32, -1 as u32, message.Data(), severity);
+    }
+
+    pub fn Log(message: *i8, severity: LogSeverity) {
+        Logger::Log(logger->executable.Data(), -1 as u32, -1 as u32, -1 as u32, -1 as u32, message, severity);
+    }
+
+    pub fn Log(message: *i8, span: SourceSpan, severity: LogSeverity) {
+        let file = Sources()->File(span.file);
+
+        if file == null {
+            Logger::Log(message, severity);
+            return;
+        }
+
+        let line = file->Line(span.start);
+        Logger::Log(file->path.Data(), (line + 1) as u32, file->Column(span.start), -1 as u32, -1 as u32, message, severity);
+        Logger::Snippet(file, line, span, severity);
+    }
+
+    pub fn Log(message: &String, span: SourceSpan, severity: LogSeverity) {
+        Logger::Log(message.Data(), span, severity);
+    }
+
+    fn Snippet(file: *SourceFile, line: usize, span: SourceSpan, severity: LogSeverity) {
+        let text = file->LineText(line);
+        let line_start = file->LineStart(line);
+        let length = text.Length();
+        let mut start = (span.start - line_start) as usize;
+        if start > length { start = length; }
+        let mut end = if span.end > line_start { (span.end - line_start) as usize } else { 0 };
+        if end > length { end = length; }
+        if end < start { end = start; }
+        let mut marker = String();
+
+        for i in 0..start {
+            if text[i] == '\t' { marker += '\t'; } else if (text[i] as u8 & 0xC0) != 0x80 { marker += ' '; }
+        }
+
+        let mut count: usize = 0;
+
+        for i in start..end {
+            if (text[i] as u8 & 0xC0) != 0x80 { count += 1; }
+        }
+
+        marker += match severity {
+            LogSeverity::Warning => "\x1b[35m",
+            LogSeverity::Info => "\x1b[36m",
+            _ => "\x1b[31m"
+        };
+
+        marker += '^' * (if count > 0 { count } else { 1 });
+        marker += "\x1b[0m";
+        let number = String::FromInteger((line + 1) as HostUnsigned);
+        WriteLine("    " + number + " | " + text);
+        WriteLine("    " + (' ' * number.Length()) + " | " + marker);
+    }
+
+    pub fn Clear() {
+        logger->logs.Clear();
+        logger->has_error = false;
+    }
+
+    pub fn HasError() -> bool {
+        logger->has_error
+    }
+}
+
+static mut logger: *mut Logger = null;

@@ -1,0 +1,142 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "src/Source.zir" : *]
+
+enum TokenType: u8 {
+    Unknown, EndOfFile,
+
+    Identifier, Integer, String,
+
+    Module, Extern, Enum, Type, Const, Let, Wire, Reg, In, Out,
+    Seq, Comb, If, Else, Match, As, True, False,
+
+    Assign, NonBlocking,
+
+    Plus, Minus, Mul, Div, Mod, And, Or, Not,
+    BitwiseAnd, BitwiseOr, BitwiseXor, LeftShift, RightShift,
+    Equal, NotEqual, Greater, Less, GreaterEqual, LessEqual,
+
+    LeftParen, RightParen, LeftBrace, RightBrace, LeftBracket, RightBracket,
+    Dot, Comma, Colon, DoubleColon, Semicolon, Arrow, FatArrow,
+
+    PreprocessorStart
+}
+
+extend TokenType {
+    pub fn Describe(this) -> String {
+        match this {
+            TokenType::Unknown => "unknown token",
+            TokenType::EndOfFile => "end of file",
+            TokenType::Identifier => "identifier",
+            TokenType::Integer => "integer literal",
+            TokenType::String => "string literal",
+            TokenType::Module => "'module'",
+            TokenType::Extern => "'extern'",
+            TokenType::Enum => "'enum'",
+            TokenType::Type => "'type'",
+            TokenType::Const => "'const'",
+            TokenType::Let => "'let'",
+            TokenType::Wire => "'wire'",
+            TokenType::Reg => "'reg'",
+            TokenType::In => "'in'",
+            TokenType::Out => "'out'",
+            TokenType::Seq => "'seq'",
+            TokenType::Comb => "'comb'",
+            TokenType::If => "'if'",
+            TokenType::Else => "'else'",
+            TokenType::Match => "'match'",
+            TokenType::As => "'as'",
+            TokenType::True => "'true'",
+            TokenType::False => "'false'",
+            TokenType::Assign => "'='",
+            TokenType::NonBlocking => "'<-'",
+            TokenType::Plus => "'+'",
+            TokenType::Minus => "'-'",
+            TokenType::Mul => "'*'",
+            TokenType::Div => "'/'",
+            TokenType::Mod => "'%'",
+            TokenType::And => "'&&'",
+            TokenType::Or => "'||'",
+            TokenType::Not => "'!'",
+            TokenType::BitwiseAnd => "'&'",
+            TokenType::BitwiseOr => "'|'",
+            TokenType::BitwiseXor => "'^'",
+            TokenType::LeftShift => "'<<'",
+            TokenType::RightShift => "'>>'",
+            TokenType::Equal => "'=='",
+            TokenType::NotEqual => "'!='",
+            TokenType::Greater => "'>'",
+            TokenType::Less => "'<'",
+            TokenType::GreaterEqual => "'>='",
+            TokenType::LessEqual => "'<='",
+            TokenType::LeftParen => "'('",
+            TokenType::RightParen => "')'",
+            TokenType::LeftBrace => "'{'",
+            TokenType::RightBrace => "'}'",
+            TokenType::LeftBracket => "'['",
+            TokenType::RightBracket => "']'",
+            TokenType::Dot => "'.'",
+            TokenType::Comma => "','",
+            TokenType::Colon => "':'",
+            TokenType::DoubleColon => "'::'",
+            TokenType::Semicolon => "';'",
+            TokenType::Arrow => "'->'",
+            TokenType::FatArrow => "'=>'",
+            TokenType::PreprocessorStart => "'#['"
+        }.ToString()
+    }
+}
+
+fn StringToKeyword(string: &String) -> TokenType {
+    if string == "module" { TokenType::Module }
+    else if string == "extern" { TokenType::Extern }
+    else if string == "enum" { TokenType::Enum }
+    else if string == "type" { TokenType::Type }
+    else if string == "const" { TokenType::Const }
+    else if string == "let" { TokenType::Let }
+    else if string == "wire" { TokenType::Wire }
+    else if string == "reg" { TokenType::Reg }
+    else if string == "in" { TokenType::In }
+    else if string == "out" { TokenType::Out }
+    else if string == "seq" { TokenType::Seq }
+    else if string == "comb" { TokenType::Comb }
+    else if string == "if" { TokenType::If }
+    else if string == "else" { TokenType::Else }
+    else if string == "match" { TokenType::Match }
+    else if string == "as" { TokenType::As }
+    else if string == "true" { TokenType::True }
+    else if string == "false" { TokenType::False }
+    else { TokenType::Identifier }
+}
+
+class Token {
+    pub _type: TokenType,
+    pub span: SourceSpan;
+
+    pub fn Text(&this) -> String {
+        let file = Sources()->File(this.span.file);
+        if file == null { return String(); }
+        String(file->text, this.span.start as usize, (this.span.end - this.span.start) as usize)
+    }
+
+    pub fn Describe(&this) -> String {
+        match this._type {
+            TokenType::EndOfFile => "end of file".ToString(),
+            _ => "'" + this.Text() + "'"
+        }
+    }
+}
