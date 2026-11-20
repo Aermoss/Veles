@@ -17,7 +17,7 @@
 #[include "std/str", "std/vec", "std/map", "src/Source.zir", "src/AST.zir" : *]
 
 enum TypeKind: u8 {
-    Error, Integer, Bits, Enum, Array, Clock, Reset
+    Error, Integer, Bits, Enum, Array, Group, Clock, Reset
 }
 
 class Type {
@@ -26,7 +26,10 @@ class Type {
     pub signed: bool = false,
     pub enumeration: *mut EnumInfo = null,
     pub element: *mut Type = null,
-    pub length: u32 = 0;
+    pub length: u32 = 0,
+    pub group: *mut Symbol = null,
+    pub instance: *mut Symbol = null,
+    pub port: *mut Symbol = null;
 
     Type(&mut this, kind: TypeKind) {
         this.kind = kind;
@@ -38,6 +41,7 @@ class Type {
     pub fn IsBool(&this) -> bool { this.kind == TypeKind::Bits && this.width == 1 && !this.signed }
     pub fn IsEnum(&this) -> bool { this.kind == TypeKind::Enum }
     pub fn IsArray(&this) -> bool { this.kind == TypeKind::Array }
+    pub fn IsGroup(&this) -> bool { this.kind == TypeKind::Group }
     pub fn IsClock(&this) -> bool { this.kind == TypeKind::Clock }
     pub fn IsReset(&this) -> bool { this.kind == TypeKind::Reset }
 
@@ -59,7 +63,7 @@ class Type {
                 (if this.signed { "i" } else { "u" }) + String::FromInteger(this.width as u64)
             },
             TypeKind::Enum => this.enumeration->name,
-            TypeKind::Array => "[" + this.element->Describe() + "; " + String::FromInteger(this.length as u64) + "]",
+            TypeKind::Array | TypeKind::Group => "[" + this.element->Describe() + "; " + String::FromInteger(this.length as u64) + "]",
             TypeKind::Clock => "clock".ToString(),
             TypeKind::Reset => "reset".ToString()
         }
@@ -73,7 +77,7 @@ fn SameType(a: *mut Type, b: *mut Type) -> bool {
     match a->kind {
         TypeKind::Bits => a->width == b->width && a->signed == b->signed,
         TypeKind::Enum => a->enumeration == b->enumeration,
-        TypeKind::Array => a->length == b->length && SameType(a->element, b->element),
+        TypeKind::Array | TypeKind::Group => a->length == b->length && SameType(a->element, b->element),
         _ => true
     }
 }
@@ -109,7 +113,7 @@ class EnumInfo {
 }
 
 enum SymbolKind: u8 {
-    Constant, Enumeration, Alias, Module, Port, Let, Wire, Register, Instance
+    Constant, Enumeration, Alias, Module, Port, Let, Wire, Register, Instance, Group
 }
 
 extend SymbolKind {
@@ -123,7 +127,8 @@ extend SymbolKind {
             SymbolKind::Let => "signal",
             SymbolKind::Wire => "wire",
             SymbolKind::Register => "register",
-            SymbolKind::Instance => "instance"
+            SymbolKind::Instance => "instance",
+            SymbolKind::Group => "array"
         }.ToString()
     }
 }
@@ -146,13 +151,17 @@ class Symbol {
     pub module: *mut ModuleInfo = null,
     pub input: bool = false,
     pub output: bool = false,
+    pub bidirectional: bool = false,
     pub registered: bool = false,
     pub init: *mut ASTExpression = null,
+    pub memory_file: String,
     pub power_on: bool = false,
     pub driver: DriverKind = DriverKind::None,
     pub driver_node: *mut ASTNode = null,
     pub driver_span: SourceSpan,
-    pub instance: *mut ASTInstanceExpression = null;
+    pub instance: *mut ASTInstanceExpression = null,
+    pub elements: Vector<*mut Symbol>,
+    pub member: SymbolKind = SymbolKind::Let;
 
     Symbol(&mut this, kind: SymbolKind, name: &String, span: SourceSpan) {
         (this.kind, this.name, this.span, this.driver_span) = (kind, name, span, span);
@@ -165,7 +174,10 @@ class Symbol {
 
 class Scope {
     pub parent: *mut Scope = null,
-    pub symbols: Map<String, *mut Symbol>;
+    pub symbols: Map<String, *mut Symbol>,
+    pub iteration: bool = false,
+    pub start: i64 = 0,
+    pub owner: *mut ASTNode = null;
 
     Scope(&mut this, parent: *mut Scope) {
         this.parent = parent;
@@ -192,7 +204,11 @@ class ModuleInfo {
     pub symbol: *mut Symbol = null,
     pub scope: *mut Scope = null,
     pub ports: Vector<*mut Symbol>,
+    pub port_groups: Vector<*mut Symbol>,
+    pub disabled: Vector<String>,
     pub signals: Vector<*mut Symbol>,
+    pub elaborated: Vector<*mut ASTItem>,
+    pub scopes: Vector<*mut Scope>,
     pub enums: Vector<*mut EnumInfo>,
     pub clock: *mut Symbol = null,
     pub reset: *mut Symbol = null,
@@ -205,6 +221,14 @@ class ModuleInfo {
     pub fn FindPort(&this, name: &String) -> *mut Symbol {
         for port in this.ports {
             if port->name == name { return port; }
+        }
+
+        null
+    }
+
+    pub fn FindPortGroup(&this, name: &String) -> *mut Symbol {
+        for group in this.port_groups {
+            if group->name == name { return group; }
         }
 
         null

@@ -1,0 +1,194 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file" : *]
+
+extern "C" {
+    fn system(command: *i8) -> i32;
+    fn GetEnvironmentVariableA(lpName: *i8, lpBuffer: *mut i8, nSize: u32) -> u32;
+    fn SetEnvironmentVariableA(lpName: *i8, lpValue: *i8) -> i32;
+    fn SetCurrentDirectoryA(lpPathName: *i8) -> i32;
+    fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: *mut i8) -> u32;
+}
+
+const ENVIRONMENT_LIMIT: usize = 32767;
+const FOLDER_LIMIT: usize = 1024;
+
+fn Environment(name: *i8) -> String {
+    let mut buffer: [i8; 32767];
+    let length = GetEnvironmentVariableA(name, &mut buffer[0], ENVIRONMENT_LIMIT as u32);
+    if length == 0 || length >= ENVIRONMENT_LIMIT as u32 { return String(); }
+    String(&buffer[0] as *i8, 0, length as usize)
+}
+
+fn SetEnvironment(name: *i8, value: &String) {
+    SetEnvironmentVariableA(name, value.Data());
+}
+
+fn CurrentFolder() -> String {
+    let mut buffer: [i8; 1024];
+    let length = GetCurrentDirectoryA(FOLDER_LIMIT as u32, &mut buffer[0]);
+    if length == 0 || length >= FOLDER_LIMIT as u32 { return String(); }
+    Slashes(String(&buffer[0] as *i8, 0, length as usize))
+}
+
+fn EnterFolder(path: &String) -> bool {
+    SetCurrentDirectoryA(Native(path).Data()) != 0
+}
+
+fn Slashes(path: &String) -> String {
+    path.Replace("\\", "/")
+}
+
+fn Join(folder: &String, name: &String) -> String {
+    Slashes(JoinPath(folder, name))
+}
+
+fn Native(path: &String) -> String {
+    path.Replace("/", "\\")
+}
+
+fn Quote(text: &String) -> String {
+    "\"" + text + "\""
+}
+
+fn IsAbsolute(path: &String) -> bool {
+    (path.Length() > 1 && path[1] == ':') || path.StartsWith('/') || path.StartsWith('\\')
+}
+
+fn Parent(path: &String) -> String {
+    let (folder, _) = SplitPath(String(path));
+    folder
+}
+
+fn FileName(path: &String) -> String {
+    let (_, name) = SplitPath(String(path));
+    name
+}
+
+fn Stem(path: &String) -> String {
+    let (name, _) = SplitExtension(FileName(path));
+    name
+}
+
+fn MakeFolders(path: &String) -> bool {
+    if path.Empty() || FolderExists(path) { return true; }
+    let parent = Parent(path);
+    if !parent.Empty() && !(parent == path) && !MakeFolders(parent) { return false; }
+
+    match CreateFolder(path) {
+        Result<(), IOError>::Ok(_) => true,
+        Result<(), IOError>::Err(_) => FolderExists(path)
+    }
+}
+
+fn RemoveTree(path: &String) -> bool {
+    if !FolderExists(path) { return true; }
+
+    if let Result<Vector<FolderEntry>, IOError>::Ok(entries) = ListFolder(path) {
+        for entry in entries {
+            if entry.name == "." || entry.name == ".." { continue; }
+            let child = Join(path, entry.name);
+
+            if entry.kind == EntryKind::Folder {
+                if !RemoveTree(child) { return false; }
+            } else if let Result<(), IOError>::Err(_) = RemoveFile(child) {
+                return false;
+            }
+        }
+    }
+
+    match RemoveFolder(path) {
+        Result<(), IOError>::Ok(_) => true,
+        Result<(), IOError>::Err(_) => false
+    }
+}
+
+fn CopyFile(source: &String, target: &String) -> bool {
+    match File::ReadBytes(source) {
+        Result<Vector<u8>, IOError>::Ok(bytes) => {
+            match File::WriteBytes(target, bytes) {
+                Result<(), IOError>::Ok(_) => true,
+                Result<(), IOError>::Err(_) => false
+            }
+        },
+        Result<Vector<u8>, IOError>::Err(_) => false
+    }
+}
+
+fn ReadText(path: &String) -> String {
+    match File::ReadText(path) {
+        Result<String, IOError>::Ok(text) => text.Replace("\r", ""),
+        Result<String, IOError>::Err(_) => String()
+    }
+}
+
+fn WriteText(path: &String, text: &String) -> bool {
+    match File::WriteText(path, text) {
+        Result<(), IOError>::Ok(_) => true,
+        Result<(), IOError>::Err(error) => {
+            WriteErrorLine("veles: cannot write " + path + ": " + error.ToString());
+            false
+        }
+    }
+}
+
+fn FindInPath(name: *i8) -> String {
+    for folder in Environment("PATH").Split(';') {
+        if folder.Empty() { continue; }
+        let candidate = Join(folder, name.ToString());
+        if FileExists(candidate) { return Slashes(candidate); }
+    }
+
+    String()
+}
+
+fn Run(program: &String, arguments: &String, log: &String) -> i32 {
+    let mut line = Quote(Native(program)) + " " + arguments;
+    if !log.Empty() { line += " > " + Quote(Native(log)) + " 2>&1"; }
+    let command = Quote(line);
+    system(command.Data())
+}
+
+fn Launch(program: &String, arguments: &String) {
+    let command = Quote("start \"\" " + Quote(Native(program)) + " " + arguments);
+    system(command.Data());
+}
+
+fn Lines(path: &String) -> Vector<String> {
+    ReadText(path).Split('\n')
+}
+
+fn ShowMatches(path: &String, pattern: *i8, limit: usize) {
+    let mut shown: usize = 0;
+
+    for line in Lines(path) {
+        if shown < limit && line.Contains(pattern) {
+            WriteLine("  " + line.Strip());
+            shown += 1;
+        }
+    }
+}
+
+fn ShowTail(path: &String, count: usize) {
+    let lines = Lines(path);
+    let mut start = if lines.Length() > count { lines.Length() - count } else { 0 };
+
+    while start < lines.Length() {
+        WriteLine("  " + lines[start]);
+        start += 1;
+    }
+}

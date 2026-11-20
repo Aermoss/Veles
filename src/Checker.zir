@@ -91,6 +91,7 @@ class Checker {
     pub global: *mut Scope = null,
     pub enums: Vector<*mut EnumInfo>,
     pub modules: Vector<*mut ModuleInfo>,
+    pub root: *mut ASTFile = null,
     error_type: *mut Type = null,
     integer_type: *mut Type = null,
     bool_type: *mut Type = null,
@@ -228,22 +229,50 @@ class Checker {
         }
     }
 
+    fn IsBuiltinName(&mut this, name: &String) -> bool {
+        name == "bool" || name == "clock" || name == "reset" || this.ParseBuiltinWidth(name) > 0
+    }
+
     fn Define(&mut this, scope: *mut Scope, symbol: *mut Symbol) {
-        let existing = scope->LookupLocal(symbol->name);
+        this.DefineAs(scope, symbol->name, symbol);
+    }
+
+    fn DefineAs(&mut this, scope: *mut Scope, key: &String, symbol: *mut Symbol) -> bool {
+        let existing = scope->LookupLocal(key);
 
         if existing != null {
-            this.Error(Quote(symbol->name) + " is already defined.", symbol->span);
+            this.Error(Quote(key) + " is already defined.", symbol->span);
             this.Note("Previous definition is here.", existing->span);
-            return;
+            return false;
         }
 
-        if symbol->name == "bool" || symbol->name == "clock" || symbol->name == "reset" || this.ParseBuiltinWidth(symbol->name) > 0 {
-            this.Error(Quote(symbol->name) + " is a built-in type name and cannot be redefined.", symbol->span);
-            return;
+        if this.IsBuiltinName(key) {
+            this.Error(Quote(key) + " is a built-in type name and cannot be redefined.", symbol->span);
+            return false;
         }
 
         symbol->scope = scope;
-        scope->symbols[symbol->name] = symbol;
+        scope->symbols[key] = symbol;
+        true
+    }
+
+    fn DefineMember(&mut this, scope: *mut Scope, key: &String, symbol: *mut Symbol) {
+        if !this.DefineAs(scope, key, symbol) || !scope->iteration { return; }
+        let parent = scope->parent;
+        let mut group = parent->LookupLocal(key);
+
+        if group == null {
+            group = this.NewSymbol(SymbolKind::Group, key, symbol->span, scope->owner);
+            (group->member, group->value, group->resolved) = (symbol->kind, scope->start, true);
+            group->_type = this.integer_type;
+            this.DefineMember(parent, key, group);
+        } else if group->kind != SymbolKind::Group || group->node != scope->owner {
+            this.Error(Quote(key) + " is already defined.", symbol->span);
+            this.Note("Previous definition is here.", group->span);
+            return;
+        }
+
+        group->elements.PushBack(symbol);
     }
 
     fn NewSymbol(&mut this, kind: SymbolKind, name: &String, span: SourceSpan, node: *mut ASTNode) -> *mut Symbol {
@@ -308,6 +337,158 @@ class Checker {
         }
     }
 
+    fn DeclareElement(&mut this, item: *mut ASTItem, scope: *mut Scope, owner: *mut ModuleInfo, suffix: &String) {
+        if !scope->iteration {
+            this.Declare(item, scope, owner);
+            return;
+        }
+
+        match item->kind {
+            ASTItemKind::Const => this.Declare(item, scope, owner),
+            ASTItemKind::Signal => {
+                let signal = item as *mut ASTSignalItem;
+
+                let kind = match signal->signal {
+                    ASTSignalKind::Let => if signal->value != null && signal->value->kind == ASTExpressionKind::Instance { SymbolKind::Instance } else { SymbolKind::Let },
+                    ASTSignalKind::Wire => SymbolKind::Wire,
+                    ASTSignalKind::Reg => SymbolKind::Register
+                };
+
+                let symbol = this.NewSymbol(kind, signal->name + suffix, item->span, item);
+                symbol->registered = kind == SymbolKind::Register;
+                signal->symbol = symbol;
+                this.DefineMember(scope, signal->name, symbol);
+                owner->signals.PushBack(symbol);
+            },
+            _ => {}
+        }
+    }
+
+    fn DeclareItems(&mut this, items: &Vector<*mut ASTItem>, scope: *mut Scope, owner: *mut ModuleInfo, suffix: &String, result: &mut Vector<*mut ASTItem>, scopes: &mut Vector<*mut Scope>) {
+        for child in items {
+            if child->kind == ASTItemKind::Const || child->kind == ASTItemKind::Type || child->kind == ASTItemKind::Enum {
+                this.DeclareElement(child, scope, owner, suffix);
+            }
+        }
+
+        for child in items {
+            match child->kind {
+                ASTItemKind::For => {
+                    let loop_item = child as *mut ASTForItem;
+                    this.ExpandFor(loop_item, scope, owner, suffix);
+                    result += loop_item->expanded;
+                    scopes += loop_item->scopes;
+                },
+                ASTItemKind::If => {
+                    let conditional = child as *mut ASTIfItem;
+                    this.ExpandIf(conditional, scope, owner, suffix);
+                    result += conditional->expanded;
+                    scopes += conditional->scopes;
+                },
+                ASTItemKind::Const | ASTItemKind::Type | ASTItemKind::Enum => {
+                    if !scope->iteration || child->kind == ASTItemKind::Const {
+                        result.PushBack(child);
+                        scopes.PushBack(scope);
+                    }
+                },
+                _ => {
+                    this.DeclareElement(child, scope, owner, suffix);
+                    result.PushBack(child);
+                    scopes.PushBack(scope);
+                }
+            }
+        }
+    }
+
+    fn ExpandFor(&mut this, item: *mut ASTForItem, scope: *mut Scope, owner: *mut ModuleInfo, suffix: &String) {
+        let first = match this.EvalConstant(item->start, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return; } };
+        let last = match this.EvalConstant(item->end, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return; } };
+
+        if last - first > 4096 {
+            this.Error("A module-level 'for' loop can have at most 4096 iterations.", item->span);
+            return;
+        }
+
+        for child in item->items {
+            if child->kind == ASTItemKind::Type || child->kind == ASTItemKind::Enum {
+                this.Error("Types and enums cannot be declared inside a module-level 'for'; declare them outside the loop.", child->span);
+            }
+        }
+
+        let mut value = first;
+
+        while value < last {
+            let inner = this.arena.New<Scope>(scope);
+            (inner->iteration, inner->start, inner->owner) = (true, first, item as *mut ASTNode);
+            let variable = this.NewSymbol(SymbolKind::Constant, item->variable, item->span, item);
+            (variable->value, variable->_type, variable->resolved) = (value, this.integer_type, true);
+            this.Define(inner, variable);
+            let mut body = Vector<*mut ASTItem>();
+
+            for child in item->items {
+                body.PushBack(this.CloneItem(child));
+            }
+
+            this.DeclareItems(body, inner, owner, suffix + "_" + String::FromInteger(value), item->expanded, item->scopes);
+            value += 1;
+        }
+    }
+
+    fn ExpandIf(&mut this, item: *mut ASTIfItem, scope: *mut Scope, owner: *mut ModuleInfo, suffix: &String) {
+        let condition = match this.EvalConstant(item->condition, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return; } };
+        let chosen = if condition != 0 { item->then } else { item->otherwise };
+        this.DeclareItems(chosen, scope, owner, suffix, item->expanded, item->scopes);
+    }
+
+    fn CloneItem(&mut this, item: *mut ASTItem) -> *mut ASTItem {
+        let span = item->span;
+
+        match item->kind {
+            ASTItemKind::Const => {
+                let constant = item as *mut ASTConstItem;
+                this.arena.New<ASTConstItem>(constant->name, constant->declared, this.CloneExpression(constant->value), span)
+            },
+            ASTItemKind::Signal => {
+                let signal = item as *mut ASTSignalItem;
+                this.arena.New<ASTSignalItem>(signal->signal, signal->name, signal->declared, this.CloneExpression(signal->value), span)
+            },
+            ASTItemKind::Assign => {
+                let assign = item as *mut ASTAssignItem;
+                this.arena.New<ASTAssignItem>(this.CloneExpression(assign->target), this.CloneExpression(assign->value), span)
+            },
+            ASTItemKind::Comb => this.arena.New<ASTCombItem>(this.CloneBlock((item as *mut ASTCombItem)->body), span),
+            ASTItemKind::Seq => {
+                let seq = item as *mut ASTSeqItem;
+                this.arena.New<ASTSeqItem>(this.CloneExpression(seq->clock), this.CloneExpression(seq->reset), this.CloneBlock(seq->body), span)
+            },
+            ASTItemKind::For => {
+                let loop_item = item as *mut ASTForItem;
+                let result = this.arena.New<ASTForItem>(loop_item->variable, this.CloneExpression(loop_item->start), this.CloneExpression(loop_item->end), span);
+
+                for child in loop_item->items {
+                    result->items.PushBack(this.CloneItem(child));
+                }
+
+                result
+            },
+            ASTItemKind::If => {
+                let conditional = item as *mut ASTIfItem;
+                let result = this.arena.New<ASTIfItem>(this.CloneExpression(conditional->condition), span);
+
+                for child in conditional->then {
+                    result->then.PushBack(this.CloneItem(child));
+                }
+
+                for child in conditional->otherwise {
+                    result->otherwise.PushBack(this.CloneItem(child));
+                }
+
+                result
+            },
+            _ => item
+        }
+    }
+
     fn ResolveSymbol(&mut this, symbol: *mut Symbol) -> bool {
         if symbol->resolved { return !symbol->_type->IsError(); }
 
@@ -329,7 +510,8 @@ class Checker {
             SymbolKind::Module => this.ResolvePorts(symbol->module),
             SymbolKind::Let | SymbolKind::Wire | SymbolKind::Register => this.ResolveSignal(symbol),
             SymbolKind::Instance => this.ResolveInstance(symbol),
-            SymbolKind::Port => {}
+            SymbolKind::Port => {},
+            SymbolKind::Group => { symbol->_type = this.integer_type; }
         }
 
         (symbol->resolving, symbol->resolved) = (false, true);
@@ -444,13 +626,54 @@ class Checker {
         module->scope = this.arena.New<Scope>(this.global);
         let mut valid = true;
 
+        if !item->external && !item->parameters.Empty() {
+            this.Error("Only extern modules can have parameters.", item->span);
+            valid = false;
+        }
+
+        for i in 0..item->parameters.Length() {
+            for j in 0..i {
+                if item->parameters[i] == item->parameters[j] {
+                    this.Error("Parameter " + Quote(item->parameters[i]) + " is declared more than once.", item->span);
+                    valid = false;
+                }
+            }
+        }
+
         for port in item->ports {
+            if port->condition != null {
+                match this.EvalConstant(port->condition, this.global) {
+                    Option<i64>::Some(value) => {
+                        if value == 0 {
+                            module->disabled.PushBack(port->name);
+                            continue;
+                        }
+                    },
+                    Option<i64>::None => {
+                        valid = false;
+                        continue;
+                    }
+                }
+            }
+
+            if !item->external && port->declared->kind == ASTTypeKind::Array {
+                if !this.ResolvePortGroup(module, port) { valid = false; }
+                continue;
+            }
+
             let symbol = this.NewSymbol(SymbolKind::Port, port->name, port->span, port);
-            (symbol->input, symbol->output, symbol->registered) = (port->input, !port->input, port->registered);
+            let input = port->input || port->bidirectional;
+            (symbol->input, symbol->output, symbol->registered, symbol->bidirectional) = (input, !input, port->registered, port->bidirectional);
             symbol->_type = this.ResolveType(port->declared, this.global);
             (symbol->resolved, symbol->init) = (true, port->init);
             port->symbol = symbol;
-            this.Define(module->scope, symbol);
+
+            if !item->external || !this.IsBuiltinName(port->name) {
+                this.Define(module->scope, symbol);
+            } else if module->FindPort(port->name) != null {
+                this.Error(Quote(port->name) + " is already defined.", port->span);
+            }
+
             module->ports.PushBack(symbol);
 
             if symbol->_type->IsError() {
@@ -468,7 +691,12 @@ class Checker {
                 valid = false;
             }
 
-            if port->input {
+            if port->bidirectional && (!symbol->_type->IsBits() || port->init != null) {
+                this.Error("An 'inout' port must be a plain bit vector without an initial value.", port->declared->span);
+                valid = false;
+            }
+
+            if input {
                 symbol->driver = DriverKind::Input;
                 if symbol->_type->IsClock() && module->clock == null { module->clock = symbol; }
                 if symbol->_type->IsReset() && module->reset == null { module->reset = symbol; }
@@ -477,6 +705,183 @@ class Checker {
 
         module->ports_resolved = true;
         module->symbol->_type = if valid { this.integer_type } else { this.error_type };
+    }
+
+    fn ResolvePortGroup(&mut this, module: *mut ModuleInfo, port: *mut ASTPort) -> bool {
+        let _type = this.ResolveType(port->declared, this.global);
+        if _type->IsError() { return false; }
+
+        if port->bidirectional {
+            this.Error("An 'inout' port cannot be an array.", port->declared->span);
+            return false;
+        }
+
+        let input = port->input;
+        let group = this.NewSymbol(SymbolKind::Group, port->name, port->span, port);
+        (group->member, group->resolved, group->_type) = (SymbolKind::Port, true, this.integer_type);
+        port->symbol = group;
+        this.Define(module->scope, group);
+        module->port_groups.PushBack(group);
+
+        for k in 0..(_type->length as i64) {
+            let element = this.NewSymbol(SymbolKind::Port, port->name + "_" + String::FromInteger(k), port->span, port);
+            (element->input, element->output, element->registered) = (input, !input, port->registered);
+            (element->_type, element->resolved, element->init, element->scope) = (_type->element, true, port->init, module->scope);
+            if input { element->driver = DriverKind::Input; }
+            group->elements.PushBack(element);
+            module->ports.PushBack(element);
+        }
+
+        true
+    }
+
+    fn HoldsInstances(&this, group: *mut Symbol) -> bool {
+        if group->elements.Empty() { return false; }
+        let first = group->elements[0];
+        first->kind == SymbolKind::Instance || (first->kind == SymbolKind::Group && this.HoldsInstances(first))
+    }
+
+    fn GroupType(&mut this, group: *mut Symbol, instance: *mut Symbol, span: SourceSpan) -> *mut Type {
+        if group->elements.Empty() { return this.error_type; }
+        let mut element: *mut Type = null;
+
+        for member in group->elements {
+            let mut current = this.error_type;
+
+            if member->kind == SymbolKind::Group {
+                current = this.GroupType(member, instance, span);
+            } else if this.ResolveSymbol(member) {
+                current = member->_type;
+            }
+
+            if current->IsError() { return this.error_type; }
+
+            if element == null {
+                element = current;
+            } else if !SameType(element, current) {
+                this.Error("The elements of " + Quote(group->name) + " have different types, " + Quote(element->Describe()) + " and " + Quote(current->Describe()) + ".", span);
+                return this.error_type;
+            }
+        }
+
+        let result = this.arena.New<Type>(TypeKind::Group);
+        (result->element, result->length, result->group, result->instance) = (element, group->elements.Length() as u32, group, instance);
+        result
+    }
+
+    fn SelectElement(&mut this, group: *mut Symbol, index: *mut ASTExpression, scope: *mut Scope) -> *mut Symbol {
+        let value = match this.EvalConstant(index, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return null; } };
+        let position = value - group->value;
+
+        if position < 0 || position >= group->elements.Length() as i64 {
+            this.Error("Index " + String::FromInteger(value) + " is out of range for " + Quote(group->name) + ", which has elements " +
+                String::FromInteger(group->value) + " to " + String::FromInteger(group->value + group->elements.Length() as i64 - 1) + ".", index->span);
+            return null;
+        }
+
+        group->elements[position as usize]
+    }
+
+    fn GroupElement(&mut this, base: *mut ASTExpression, _type: *mut Type, position: i64) -> *mut ASTExpression {
+        let element = _type->group->elements[position as usize];
+
+        if _type->port != null {
+            let member = this.arena.New<ASTMemberExpression>(base, _type->port->name, base->span);
+            (member->instance, member->port, member->resolved) = (element, _type->port, _type->port->_type);
+            return member;
+        }
+
+        if _type->instance != null {
+            let member = this.arena.New<ASTMemberExpression>(base, element->name, base->span);
+            (member->instance, member->port, member->resolved) = (_type->instance, element, element->_type);
+            return member;
+        }
+
+        let path = this.MakePath(element->name, base->span);
+        path->symbol = element;
+        path->resolved = if element->kind == SymbolKind::Group { this.GroupType(element, null, base->span) } else { element->_type };
+        path
+    }
+
+    fn InstanceGroupOf(&mut this, expression: *mut ASTExpression, scope: *mut Scope) -> *mut Symbol {
+        if expression->kind == ASTExpressionKind::Path && (expression as *mut ASTPathExpression)->segments.Length() == 1 {
+            let name = (expression as *mut ASTPathExpression)->segments[0];
+            let symbol = scope->Lookup(name);
+
+            if symbol == null {
+                this.Error("Cannot find " + Quote(name) + " in this scope.", expression->span);
+                return null;
+            }
+
+            if symbol->kind != SymbolKind::Group || !this.HoldsInstances(symbol) {
+                this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not an array of instances.", expression->span);
+                return null;
+            }
+
+            return symbol;
+        }
+
+        if expression->kind == ASTExpressionKind::Index {
+            let index = expression as *mut ASTIndexExpression;
+            let outer = this.InstanceGroupOf(index->base, scope);
+            if outer == null { return null; }
+            let element = this.SelectElement(outer, index->index, scope);
+            if element == null { return null; }
+
+            if element->kind != SymbolKind::Group {
+                this.Error("Too many indices for " + Quote(outer->name) + ".", expression->span);
+                return null;
+            }
+
+            return element;
+        }
+
+        this.Error("Only instance outputs can be accessed with '.'.", expression->span);
+        null
+    }
+
+    fn InstanceOf(&mut this, base: *mut ASTExpression, scope: *mut Scope) -> *mut Symbol {
+        if base->kind == ASTExpressionKind::Index {
+            let index = base as *mut ASTIndexExpression;
+            let group = this.InstanceGroupOf(index->base, scope);
+            if group == null { return null; }
+            let element = this.SelectElement(group, index->index, scope);
+            if element == null { return null; }
+
+            if element->kind != SymbolKind::Instance {
+                this.Error(Quote(group->name) + " has more dimensions; select one instance with an index for each.", base->span);
+                return null;
+            }
+
+            base->resolved = this.error_type;
+            return element;
+        }
+
+        if base->kind != ASTExpressionKind::Path || (base as *mut ASTPathExpression)->segments.Length() != 1 {
+            this.Error("Only instance outputs can be accessed with '.'.", base->span);
+            return null;
+        }
+
+        let name = (base as *mut ASTPathExpression)->segments[0];
+        let symbol = scope->Lookup(name);
+
+        if symbol == null {
+            this.Error("Cannot find " + Quote(name) + " in this scope.", base->span);
+            return null;
+        }
+
+        if symbol->kind == SymbolKind::Group && this.HoldsInstances(symbol) {
+            this.Error(Quote(name) + " is an array of instances; select one with '" + name + "[k]." + "<port>'.", base->span);
+            return null;
+        }
+
+        if symbol->kind != SymbolKind::Instance {
+            this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not an instance.", base->span);
+            return null;
+        }
+
+        base->resolved = this.error_type;
+        symbol
     }
 
     fn ResolveSignal(&mut this, symbol: *mut Symbol) {
@@ -504,6 +909,11 @@ class Checker {
 
             let _type = this.CheckExpression(item->value, scope, Context::Module, null);
             if _type->IsError() { return; }
+
+            if _type->IsGroup() {
+                this.Error("An array cannot be stored in a 'let'; index it or connect it to an array port.", item->span);
+                return;
+            }
 
             if _type->IsInteger() {
                 this.Error("Cannot infer the width of " + Quote(symbol->name) + "; add a type such as 'let " + symbol->name + ": u8 = ...' or use 'const'.", item->span);
@@ -536,7 +946,15 @@ class Checker {
 
         if item->value != null {
             if _type->IsArray() {
-                this.Error("Memories cannot have an initial value yet.", item->value->span);
+                let call = item->value as *mut ASTCallExpression;
+
+                if item->value->kind != ASTExpressionKind::Call || call->name != "readmemh" || call->arguments.Length() != 1 ||
+                    call->arguments[0]->kind != ASTExpressionKind::String {
+                    this.Error("A memory can only be initialized from a file with 'readmemh(\"file.hex\")'.", item->value->span);
+                    return;
+                }
+
+                symbol->memory_file = (call->arguments[0] as *mut ASTStringLiteral)->text;
                 return;
             }
 
@@ -546,6 +964,11 @@ class Checker {
     }
 
     fn CheckInitial(&mut this, value: *mut ASTExpression, scope: *mut Scope, _type: *mut Type) {
+        if value->kind == ASTExpressionKind::Call && (value as *mut ASTCallExpression)->name == "readmemh" {
+            this.Error("Only memories can be initialized with 'readmemh'; declare it as 'reg name: [T; N]'.", value->span);
+            return;
+        }
+
         let actual = this.CheckExpression(value, scope, Context::Module, _type);
         if actual->IsError() { return; }
 
@@ -587,13 +1010,80 @@ class Checker {
         if module == null { return; }
         let mut connected = Vector<*mut Symbol>();
         let mut valid = true;
+        let mut assigned = Vector<String>();
+
+        for parameter in instance->parameters {
+            if !module->item->parameters.Contains(parameter->name) {
+                this.Error("Module " + Quote(module->name) + " has no parameter named " + Quote(parameter->name) + ".", parameter->span);
+                valid = false;
+                continue;
+            }
+
+            if assigned.Contains(parameter->name) {
+                this.Error("Parameter " + Quote(parameter->name) + " is set more than once.", parameter->span);
+                valid = false;
+                continue;
+            }
+
+            assigned.PushBack(parameter->name);
+
+            if parameter->value->kind == ASTExpressionKind::String {
+                parameter->text = "\"" + (parameter->value as *mut ASTStringLiteral)->text + "\"";
+                continue;
+            }
+
+            match this.EvalConstant(parameter->value, scope) {
+                Option<i64>::Some(value) => { parameter->text = String::FromInteger(value); },
+                Option<i64>::None => { valid = false; }
+            }
+        }
+
+        let mut expanded = Vector<*mut ASTConnection>();
 
         for connection in instance->connections {
+            if module->disabled.Contains(connection->name) { continue; }
             let port = module->FindPort(connection->name);
 
             if port == null {
-                this.Error("Module " + Quote(module->name) + " has no port named " + Quote(connection->name) + ".", connection->span);
-                valid = false;
+                let group = module->FindPortGroup(connection->name);
+
+                if group == null {
+                    this.Error("Module " + Quote(module->name) + " has no port named " + Quote(connection->name) + ".", connection->span);
+                    valid = false;
+                    continue;
+                }
+
+                if !group->elements[0]->input {
+                    this.Error(Quote(connection->name) + " is an output of " + Quote(module->name) + "; read it as '" + symbol->name + "." + connection->name + "' instead.", connection->span);
+                    valid = false;
+                    continue;
+                }
+
+                if connected.Contains(group->elements[0]) {
+                    this.Error("Port " + Quote(connection->name) + " is connected more than once.", connection->span);
+                    valid = false;
+                    continue;
+                }
+
+                for element in group->elements { connected.PushBack(element); }
+                let expected = this.GroupType(group, null, connection->span);
+                let actual = this.CheckExpression(connection->value, scope, Context::Module, null);
+                if expected->IsError() || actual->IsError() { valid = false; continue; }
+
+                if !actual->IsGroup() || !SameType(actual, expected) {
+                    this.Error("Port " + Quote(connection->name) + " expects " + Quote(expected->Describe()) + ", found " + Quote(actual->Describe()) + ".", connection->value->span);
+                    valid = false;
+                    continue;
+                }
+
+                for k in 0..group->elements.Length() {
+                    let element = group->elements[k];
+                    let value = this.GroupElement(connection->value, actual, k as i64);
+                    let link = this.arena.New<ASTConnection>(element->name, value, connection->span);
+                    link->port = element;
+                    expanded.PushBack(link);
+                }
+
                 continue;
             }
 
@@ -614,6 +1104,16 @@ class Checker {
             if !this.CheckConnection(connection->value, scope, port) { valid = false; }
         }
 
+        instance->connections += expanded;
+
+        for group in module->port_groups {
+            if group->elements[0]->input && !connected.Contains(group->elements[0]) {
+                this.Error("Missing connection for input " + Quote(group->name) + " of " + Quote(module->name) + ".", instance->span);
+                valid = false;
+                for element in group->elements { connected.PushBack(element); }
+            }
+        }
+
         for port in module->ports {
             if !port->input || connected.Contains(port) { continue; }
             let mut fallback: *mut Symbol = null;
@@ -621,7 +1121,7 @@ class Checker {
             if port->_type->IsReset() { fallback = this.current->reset; }
 
             if fallback == null {
-                this.Error("Missing connection for input " + Quote(port->name) + " of " + Quote(module->name) + ".", instance->span);
+                this.Error("Missing connection for ".ToString() + (if port->bidirectional { "inout " } else { "input " }) + Quote(port->name) + " of " + Quote(module->name) + ".", instance->span);
                 valid = false;
                 continue;
             }
@@ -637,6 +1137,24 @@ class Checker {
     }
 
     fn CheckConnection(&mut this, value: *mut ASTExpression, scope: *mut Scope, port: *mut Symbol) -> bool {
+        if port->bidirectional {
+            let path = value as *mut ASTPathExpression;
+            let symbol = if value->kind == ASTExpressionKind::Path && path->segments.Length() == 1 { scope->Lookup(path->segments[0]) } else { null };
+
+            if symbol == null || symbol->kind != SymbolKind::Port || !symbol->bidirectional {
+                this.Error("Port " + Quote(port->name) + " is 'inout'; connect it to an 'inout' port of this module.", value->span);
+                return false;
+            }
+
+            if !SameType(symbol->_type, port->_type) {
+                this.Error("Port " + Quote(port->name) + " expects " + Quote(port->_type->Describe()) + ", found " + Quote(symbol->_type->Describe()) + ".", value->span);
+                return false;
+            }
+
+            (path->symbol, value->resolved) = (symbol, symbol->_type);
+            return true;
+        }
+
         let _type = this.CheckExpression(value, scope, Context::Module, port->_type);
         if _type->IsError() { return false; }
 
@@ -891,6 +1409,10 @@ class Checker {
             ASTExpressionKind::Instance => {
                 this.Error("Module instances are only allowed as the value of a 'let' at module level.", expression->span);
                 this.Fail(expression)
+            },
+            ASTExpressionKind::String => {
+                this.Error("String literals are only allowed in 'readmemh'.", expression->span);
+                this.Fail(expression)
             }
         }
     }
@@ -936,12 +1458,27 @@ class Checker {
                 this.SetConstant(path, symbol->_type, symbol->value)
             },
             SymbolKind::Port | SymbolKind::Let | SymbolKind::Wire | SymbolKind::Register => {
+                if symbol->bidirectional {
+                    this.Error(Quote(name) + " is an 'inout' port; it can only be connected to an 'inout' port of an instance.", path->span);
+                    return this.Fail(path);
+                }
+
                 if !this.ResolveSymbol(symbol) { return this.Fail(path); }
                 symbol->_type
             },
             SymbolKind::Instance => {
                 this.Error(Quote(name) + " is an instance; read one of its outputs with '" + name + ".<port>'.", path->span);
                 this.Fail(path)
+            },
+            SymbolKind::Group => {
+                if this.HoldsInstances(symbol) {
+                    this.Error(Quote(name) + " is an array of instances; read an output with '" + name + "[k].<port>'.", path->span);
+                    return this.Fail(path);
+                }
+
+                let _type = this.GroupType(symbol, null, path->span);
+                if _type->IsError() { return this.Fail(path); }
+                _type
             },
             _ => {
                 this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not a value.", path->span);
@@ -981,13 +1518,23 @@ class Checker {
         let op = binary->op;
 
         if op.IsLogical() {
+            let decisive: i64 = if op == ASTBinaryKind::And { 0 } else { 1 };
             let left = this.ExpectBool(binary->left, scope, context);
-            let right = this.ExpectBool(binary->right, scope, context);
-            if !left || !right { return this.Fail(binary); }
+            if !left { return this.Fail(binary); }
 
-            if binary->left->constant && binary->right->constant {
-                let value = this.FoldInteger(op, binary->left->value, binary->right->value, binary->span).Unwrap();
-                return this.SetConstant(binary, this.bool_type, value);
+            if binary->left->constant {
+                if (binary->left->value != 0) == (decisive != 0) { return this.SetConstant(binary, this.bool_type, decisive); }
+                if !this.ExpectBool(binary->right, scope, context) { return this.Fail(binary); }
+                if binary->right->constant { return this.SetConstant(binary, this.bool_type, if binary->right->value != 0 { 1 } else { 0 }); }
+                binary->folded = binary->right;
+                return this.bool_type;
+            }
+
+            if !this.ExpectBool(binary->right, scope, context) { return this.Fail(binary); }
+
+            if binary->right->constant {
+                if (binary->right->value != 0) == (decisive != 0) { return this.SetConstant(binary, this.bool_type, decisive); }
+                binary->folded = binary->left;
             }
 
             return this.bool_type;
@@ -1092,8 +1639,11 @@ class Checker {
     }
 
     fn CheckIndex(&mut this, index: *mut ASTIndexExpression, scope: *mut Scope, context: Context) -> *mut Type {
+        index->element = null;
+        index->choices.Clear();
         let base = this.CheckExpression(index->base, scope, context, null);
         if base->IsError() { return this.Fail(index); }
+        if base->IsGroup() { return this.CheckGroupIndex(index, base, scope, context); }
 
         if base->IsArray() {
             if !this.CheckIndexValue(index->index, scope, context, base->length as i64) { return this.Fail(index); }
@@ -1107,6 +1657,47 @@ class Checker {
 
         if !this.CheckIndexValue(index->index, scope, context, base->width as i64) { return this.Fail(index); }
         this.bool_type
+    }
+
+    fn CheckGroupIndex(&mut this, index: *mut ASTIndexExpression, group: *mut Type, scope: *mut Scope, context: Context) -> *mut Type {
+        let _type = this.ValueType(this.CheckExpression(index->index, scope, context, null));
+        if _type->IsError() { return this.Fail(index); }
+        let start = group->group->value;
+
+        if index->index->constant {
+            let position = index->index->value - start;
+
+            if position < 0 || position >= group->length as i64 {
+                this.Error("Index " + String::FromInteger(index->index->value) + " is out of range for " + Quote(group->group->name) + ", which has elements " +
+                    String::FromInteger(start) + " to " + String::FromInteger(start + group->length as i64 - 1) + ".", index->index->span);
+                return this.Fail(index);
+            }
+
+            index->element = this.GroupElement(index->base, group, position);
+            return index->element->resolved;
+        }
+
+        if !_type->IsBits() || _type->signed {
+            this.Error("Index must be unsigned, found " + Quote(_type->Describe()) + ".", index->index->span);
+            return this.Fail(index);
+        }
+
+        if group->element->IsGroup() {
+            this.Error("Only the last index of a nested array can be a signal.", index->index->span);
+            return this.Fail(index);
+        }
+
+        for position in 0..(group->length as i64) {
+            if _type->width < 32 && start + position >= ((1 as i64) << (_type->width as i64)) { break; }
+            index->choices.PushBack(this.GroupElement(index->base, group, position));
+        }
+
+        if index->choices.Empty() {
+            this.Error("Index of type " + Quote(_type->Describe()) + " cannot select any element of " + Quote(group->group->name) + ".", index->index->span);
+            return this.Fail(index);
+        }
+
+        group->element
     }
 
     fn CheckSlice(&mut this, slice: *mut ASTSliceExpression, scope: *mut Scope, context: Context) -> *mut Type {
@@ -1133,41 +1724,79 @@ class Checker {
     fn CheckMember(&mut this, member: *mut ASTMemberExpression, scope: *mut Scope) -> *mut Type {
         let base = member->base;
 
-        if base->kind != ASTExpressionKind::Path || (base as *mut ASTPathExpression)->segments.Length() != 1 {
-            this.Error("Only instance outputs can be accessed with '.'.", member->span);
-            return this.Fail(member);
+        if base->kind == ASTExpressionKind::Path && (base as *mut ASTPathExpression)->segments.Length() == 1 {
+            let group = scope->Lookup((base as *mut ASTPathExpression)->segments[0]);
+
+            if group != null && group->kind == SymbolKind::Group && !group->elements.Empty() && group->elements[0]->kind == SymbolKind::Instance {
+                return this.CheckGroupMember(member, group);
+            }
         }
 
-        let name = (base as *mut ASTPathExpression)->segments[0];
-        let symbol = scope->Lookup(name);
-
-        if symbol == null {
-            this.Error("Cannot find " + Quote(name) + " in this scope.", base->span);
-            return this.Fail(member);
-        }
-
-        if symbol->kind != SymbolKind::Instance {
-            this.Error(Quote(name) + " is a " + symbol->kind.Describe() + ", not an instance.", base->span);
-            return this.Fail(member);
-        }
-
+        let symbol = this.InstanceOf(base, scope);
+        if symbol == null { return this.Fail(member); }
         let module = this.InstanceModule(symbol);
         if module == null { return this.Fail(member); }
         let port = module->FindPort(member->name);
 
         if port == null {
+            let group = module->FindPortGroup(member->name);
+
+            if group != null && !group->elements[0]->input {
+                (member->instance, member->port) = (symbol, group);
+                let _type = this.GroupType(group, symbol, member->span);
+                if _type->IsError() { return this.Fail(member); }
+                return _type;
+            }
+
+            if group != null {
+                this.Error(Quote(member->name) + " is an input of " + Quote(module->name) + "; only outputs can be read.", member->span);
+                return this.Fail(member);
+            }
+
+            if module->disabled.Contains(member->name) {
+                this.Error("Port " + Quote(member->name) + " of " + Quote(module->name) + " is switched off by its '#[if]' condition.", member->span);
+                return this.Fail(member);
+            }
+
             this.Error("Module " + Quote(module->name) + " has no port named " + Quote(member->name) + ".", member->span);
             return this.Fail(member);
         }
 
         if port->input {
-            this.Error(Quote(member->name) + " is an input of " + Quote(module->name) + "; only outputs can be read.", member->span);
+            this.Error(Quote(member->name) + " is " + (if port->bidirectional { "an 'inout' port" } else { "an input" }) + " of " + Quote(module->name) + "; only outputs can be read.", member->span);
             return this.Fail(member);
         }
 
         (member->instance, member->port) = (symbol, port);
         base->resolved = this.error_type;
         port->_type
+    }
+
+    fn CheckGroupMember(&mut this, member: *mut ASTMemberExpression, group: *mut Symbol) -> *mut Type {
+        let mut port: *mut Symbol = null;
+
+        for element in group->elements {
+            let module = this.InstanceModule(element);
+            if module == null { return this.Fail(member); }
+            let found = module->FindPort(member->name);
+
+            if found == null || found->input {
+                this.Error("Module " + Quote(module->name) + " has no output named " + Quote(member->name) + ".", member->span);
+                return this.Fail(member);
+            }
+
+            if port != null && port != found {
+                this.Error("The elements of " + Quote(group->name) + " are instances of different modules.", member->span);
+                return this.Fail(member);
+            }
+
+            port = found;
+        }
+
+        let result = this.arena.New<Type>(TypeKind::Group);
+        (result->element, result->length, result->group, result->port) = (port->_type, group->elements.Length() as u32, group, port);
+        member->base->resolved = this.error_type;
+        result
     }
 
     fn CheckCall(&mut this, call: *mut ASTCallExpression, scope: *mut Scope, context: Context) -> *mut Type {
@@ -1305,6 +1934,15 @@ class Checker {
 
     fn CheckIf(&mut this, conditional: *mut ASTIfExpression, scope: *mut Scope, context: Context, expected: *mut Type) -> *mut Type {
         let condition = this.ExpectBool(conditional->condition, scope, context);
+
+        if condition && conditional->condition->constant {
+            let chosen = if conditional->condition->value != 0 { conditional->then } else { conditional->otherwise };
+            conditional->chosen = chosen;
+            let result = this.CheckExpression(chosen, scope, context, expected);
+            if result->IsError() { return this.Fail(conditional); }
+            if chosen->constant { return this.SetConstant(conditional, result, chosen->value); }
+            return result;
+        }
         let result = this.Unify(conditional->then, conditional->otherwise, scope, context, expected, conditional->span);
         if !condition || result->IsError() { return this.Fail(conditional); }
 
@@ -1328,6 +1966,8 @@ class Checker {
     }
 
     pub fn Check(&mut this, files: &Vector<*mut ASTFile>) {
+        if !files.Empty() { this.root = files[0]; }
+
         for file in files {
             for item in file->items {
                 this.Declare(item, this.global, null);
@@ -1357,10 +1997,7 @@ class Checker {
         this.current = module;
         let scope = module->scope;
         let item = module->item;
-
-        for child in item->items {
-            this.Declare(child, scope, module);
-        }
+        this.DeclareItems(item->items, scope, module, String(), module->elaborated, module->scopes);
 
         for port in module->ports {
             if port->init == null { continue; }
@@ -1375,7 +2012,7 @@ class Checker {
             }
         }
 
-        for child in item->items {
+        for child in module->elaborated {
             match child->kind {
                 ASTItemKind::Const => { this.ResolveSymbol((child as *mut ASTConstItem)->symbol); },
                 ASTItemKind::Type => { this.ResolveSymbol((child as *mut ASTTypeItem)->symbol); },
@@ -1385,14 +2022,19 @@ class Checker {
             }
         }
 
-        for child in item->items {
+        for i in 0..module->elaborated.Length() {
+            let child = module->elaborated[i];
+            let child_scope = module->scopes[i];
+
             match child->kind {
-                ASTItemKind::Assign => this.CheckAssignItem(child as *mut ASTAssignItem, scope),
-                ASTItemKind::Comb => this.CheckComb(child as *mut ASTCombItem, scope),
-                ASTItemKind::Seq => this.CheckSeq(child as *mut ASTSeqItem, scope),
+                ASTItemKind::Assign => this.CheckAssignItem(child as *mut ASTAssignItem, child_scope),
+                ASTItemKind::Comb => this.CheckComb(child as *mut ASTCombItem, child_scope),
+                ASTItemKind::Seq => this.CheckSeq(child as *mut ASTSeqItem, child_scope),
                 _ => {}
             }
         }
+
+        this.CheckNames(module);
 
         let mut symbols = module->ports;
         symbols += module->signals;
@@ -1408,12 +2050,27 @@ class Checker {
                 }
             } else if symbol->kind == SymbolKind::Wire {
                 this.Error("Wire " + Quote(symbol->name) + " is never driven.", symbol->span);
-            } else if symbol->kind == SymbolKind::Register {
+            } else if symbol->kind == SymbolKind::Register && symbol->memory_file.Empty() {
                 this.Error("Register " + Quote(symbol->name) + " is never assigned; assign it in a 'seq' block or make it a 'const'.", symbol->span);
             }
         }
 
         this.current = null;
+    }
+
+    fn CheckNames(&mut this, module: *mut ModuleInfo) {
+        let mut symbols = module->ports;
+        symbols += module->signals;
+
+        for i in 0..symbols.Length() {
+            for j in 0..i {
+                if symbols[i]->name == symbols[j]->name {
+                    this.Error(Quote(symbols[i]->name) + " is emitted twice; an array element is emitted as '<name>_<index>', so rename one of them.", symbols[i]->span);
+                    this.Note("The other one is here.", symbols[j]->span);
+                    break;
+                }
+            }
+        }
     }
 
     fn RecordDriver(&mut this, symbol: *mut Symbol, kind: DriverKind, node: *mut ASTNode, span: SourceSpan) {
@@ -1429,6 +2086,16 @@ class Checker {
 
     fn CheckAssignItem(&mut this, item: *mut ASTAssignItem, scope: *mut Scope) {
         let target = item->target;
+
+        if target->kind == ASTExpressionKind::Index && this.TargetGroup((target as *mut ASTIndexExpression)->base, scope) != null {
+            let symbol = this.CheckTarget(target, scope, Context::Module);
+            if symbol == null { return; }
+            item->symbol = symbol;
+            this.RecordDriver(symbol, DriverKind::Assign, item, item->span);
+            this.CheckExpression(item->value, scope, Context::Module, symbol->_type);
+            this.Coerce(item->value, symbol->_type);
+            return;
+        }
 
         if target->kind != ASTExpressionKind::Path || (target as *mut ASTPathExpression)->segments.Length() != 1 {
             this.Error("Continuous assignments must assign a whole wire or output; partial assignments are only allowed in 'seq' blocks.", target->span);
@@ -1451,6 +2118,49 @@ class Checker {
             this.Error("Cannot find " + Quote(path->ToString()) + " in this scope.", path->span);
             return null;
         }
+
+        if symbol->kind == SymbolKind::Group {
+            this.Error(Quote(name) + " is an array; assign one element at a time with '" + name + "[k]'.", path->span);
+            return null;
+        }
+
+        this.CheckTargetKind(symbol, path, context)
+    }
+
+    fn TargetGroup(&mut this, expression: *mut ASTExpression, scope: *mut Scope) -> *mut Symbol {
+        if expression->kind != ASTExpressionKind::Path || (expression as *mut ASTPathExpression)->segments.Length() != 1 { return null; }
+        let symbol = scope->Lookup((expression as *mut ASTPathExpression)->segments[0]);
+        if symbol == null || symbol->kind != SymbolKind::Group { return null; }
+        symbol
+    }
+
+    fn CheckElementTarget(&mut this, index: *mut ASTIndexExpression, group: *mut Symbol, scope: *mut Scope, context: Context) -> *mut Symbol {
+        let _type = this.CheckExpression(index->index, scope, context, null);
+        if _type->IsError() { return null; }
+
+        if !index->index->constant {
+            this.Error("An element of " + Quote(group->name) + " can only be assigned with a constant index.", index->index->span);
+            return null;
+        }
+
+        let element = this.SelectElement(group, index->index, scope);
+        if element == null { return null; }
+
+        if element->kind == SymbolKind::Group || element->kind == SymbolKind::Instance {
+            this.Error("Cannot assign to an element of " + Quote(group->name) + ", which is a " + element->kind.Describe() + ".", index->span);
+            return null;
+        }
+
+        let path = this.MakePath(element->name, index->span);
+        let symbol = this.CheckTargetKind(element, path, context);
+        if symbol == null { return null; }
+        index->element = path;
+        index->resolved = symbol->_type;
+        symbol
+    }
+
+    fn CheckTargetKind(&mut this, symbol: *mut Symbol, path: *mut ASTPathExpression, context: Context) -> *mut Symbol {
+        let name = symbol->name;
 
         if !symbol->IsSignal() {
             this.Error("Cannot assign to " + Quote(name) + ", which is a " + symbol->kind.Describe() + ".", path->span);
@@ -1485,14 +2195,15 @@ class Checker {
     }
 
     fn CheckTarget(&mut this, target: *mut ASTExpression, scope: *mut Scope, context: Context) -> *mut Symbol {
+        if target->kind == ASTExpressionKind::Index {
+            let index = target as *mut ASTIndexExpression;
+            let group = this.TargetGroup(index->base, scope);
+            if group != null { return this.CheckElementTarget(index, group, scope, context); }
+        }
+
         match target->kind {
             ASTExpressionKind::Path => this.CheckTargetSymbol(target as *mut ASTPathExpression, scope, context),
             ASTExpressionKind::Index | ASTExpressionKind::Slice => {
-                if context != Context::Seq {
-                    this.Error("Partial assignments are only supported in 'seq' blocks for now.", target->span);
-                    return null;
-                }
-
                 let base = if target->kind == ASTExpressionKind::Index { (target as *mut ASTIndexExpression)->base } else { (target as *mut ASTSliceExpression)->base };
                 let symbol = this.CheckTarget(base, scope, context);
                 if symbol == null { return null; }
@@ -1577,12 +2288,165 @@ class Checker {
             ASTStatementKind::Assign => this.CheckAssign(statement as *mut ASTAssignStatement, scope, context),
             ASTStatementKind::If => {
                 let conditional = statement as *mut ASTIfStatement;
-                this.ExpectBool(conditional->condition, scope, context);
+                let valid = this.ExpectBool(conditional->condition, scope, context);
+
+                if valid && conditional->condition->constant {
+                    conditional->folded = true;
+                    conditional->chosen = if conditional->condition->value != 0 { conditional->then as *mut ASTStatement } else { conditional->otherwise };
+                    if conditional->chosen != null { this.CheckStatement(conditional->chosen, scope, context); }
+                    return;
+                }
+
                 this.CheckStatement(conditional->then, scope, context);
                 if conditional->otherwise != null { this.CheckStatement(conditional->otherwise, scope, context); }
             },
-            ASTStatementKind::Match => this.CheckMatch(statement as *mut ASTMatchStatement, scope, context)
+            ASTStatementKind::Match => this.CheckMatch(statement as *mut ASTMatchStatement, scope, context),
+            ASTStatementKind::For => this.CheckFor(statement as *mut ASTForStatement, scope, context)
         }
+    }
+
+    fn CheckFor(&mut this, statement: *mut ASTForStatement, scope: *mut Scope, context: Context) {
+        let first = match this.EvalConstant(statement->start, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return; } };
+        let last = match this.EvalConstant(statement->end, scope) { Option<i64>::Some(value) => value, Option<i64>::None => { return; } };
+
+        if last - first > 65536 {
+            this.Error("A 'for' loop can have at most 65536 iterations.", statement->span);
+            return;
+        }
+
+        statement->unrolled = this.arena.New<ASTBlockStatement>(statement->span);
+        let mut value = first;
+
+        while value < last {
+            let inner = this.arena.New<Scope>(scope);
+            let symbol = this.NewSymbol(SymbolKind::Constant, statement->variable, statement->span, statement);
+            (symbol->value, symbol->_type, symbol->resolved) = (value, this.integer_type, true);
+            this.Define(inner, symbol);
+            let body = this.CloneStatement(statement->body);
+            this.CheckStatement(body, inner, context);
+            statement->unrolled->statements.PushBack(body);
+            value += 1;
+        }
+    }
+
+    fn CloneExpression(&mut this, expression: *mut ASTExpression) -> *mut ASTExpression {
+        if expression == null { return null; }
+        let span = expression->span;
+
+        match expression->kind {
+            ASTExpressionKind::Integer => {
+                let literal = expression as *mut ASTIntegerLiteral;
+                this.arena.New<ASTIntegerLiteral>(literal->literal, literal->radix, span)
+            },
+            ASTExpressionKind::Boolean => this.arena.New<ASTBooleanLiteral>((expression as *mut ASTBooleanLiteral)->literal, span),
+            ASTExpressionKind::String => this.arena.New<ASTStringLiteral>((expression as *mut ASTStringLiteral)->text, span),
+            ASTExpressionKind::Path => {
+                let path = this.arena.New<ASTPathExpression>(span);
+                path->segments = (expression as *mut ASTPathExpression)->segments;
+                path
+            },
+            ASTExpressionKind::Unary => {
+                let unary = expression as *mut ASTUnaryExpression;
+                this.arena.New<ASTUnaryExpression>(unary->op, this.CloneExpression(unary->operand), span)
+            },
+            ASTExpressionKind::Binary => {
+                let binary = expression as *mut ASTBinaryExpression;
+                this.arena.New<ASTBinaryExpression>(binary->op, this.CloneExpression(binary->left), this.CloneExpression(binary->right), span)
+            },
+            ASTExpressionKind::Index => {
+                let index = expression as *mut ASTIndexExpression;
+                this.arena.New<ASTIndexExpression>(this.CloneExpression(index->base), this.CloneExpression(index->index), span)
+            },
+            ASTExpressionKind::Slice => {
+                let slice = expression as *mut ASTSliceExpression;
+                this.arena.New<ASTSliceExpression>(this.CloneExpression(slice->base), this.CloneExpression(slice->high), this.CloneExpression(slice->low), span)
+            },
+            ASTExpressionKind::Member => {
+                let member = expression as *mut ASTMemberExpression;
+                this.arena.New<ASTMemberExpression>(this.CloneExpression(member->base), member->name, span)
+            },
+            ASTExpressionKind::Call => {
+                let call = expression as *mut ASTCallExpression;
+                let result = this.arena.New<ASTCallExpression>(call->name, span);
+
+                for argument in call->arguments {
+                    result->arguments.PushBack(this.CloneExpression(argument));
+                }
+
+                result
+            },
+            ASTExpressionKind::Cast => {
+                let cast = expression as *mut ASTCastExpression;
+                this.arena.New<ASTCastExpression>(this.CloneExpression(cast->operand), cast->target, span)
+            },
+            ASTExpressionKind::If => {
+                let conditional = expression as *mut ASTIfExpression;
+                this.arena.New<ASTIfExpression>(this.CloneExpression(conditional->condition), this.CloneExpression(conditional->then), this.CloneExpression(conditional->otherwise), span)
+            },
+            ASTExpressionKind::Instance => {
+                let instance = expression as *mut ASTInstanceExpression;
+                let result = this.arena.New<ASTInstanceExpression>(instance->module, span);
+
+                for parameter in instance->parameters {
+                    result->parameters.PushBack(this.arena.New<ASTConnection>(parameter->name, this.CloneExpression(parameter->value), parameter->span));
+                }
+
+                for connection in instance->connections {
+                    result->connections.PushBack(this.arena.New<ASTConnection>(connection->name, this.CloneExpression(connection->value), connection->span));
+                }
+
+                result
+            }
+        }
+    }
+
+    fn CloneStatement(&mut this, statement: *mut ASTStatement) -> *mut ASTStatement {
+        if statement == null { return null; }
+        let span = statement->span;
+
+        match statement->kind {
+            ASTStatementKind::Block => this.CloneBlock(statement as *mut ASTBlockStatement),
+            ASTStatementKind::Assign => {
+                let assign = statement as *mut ASTAssignStatement;
+                this.arena.New<ASTAssignStatement>(this.CloneExpression(assign->target), this.CloneExpression(assign->value), assign->nonblocking, span)
+            },
+            ASTStatementKind::If => {
+                let conditional = statement as *mut ASTIfStatement;
+                this.arena.New<ASTIfStatement>(this.CloneExpression(conditional->condition), this.CloneBlock(conditional->then), this.CloneStatement(conditional->otherwise), span)
+            },
+            ASTStatementKind::Match => {
+                let matching = statement as *mut ASTMatchStatement;
+                let result = this.arena.New<ASTMatchStatement>(this.CloneExpression(matching->scrutinee), span);
+
+                for arm in matching->arms {
+                    let copy = this.arena.New<ASTMatchArm>(arm->span);
+                    copy->wildcard = arm->wildcard;
+                    copy->body = this.CloneStatement(arm->body);
+
+                    for pattern in arm->patterns {
+                        copy->patterns.PushBack(this.CloneExpression(pattern));
+                    }
+
+                    result->arms.PushBack(copy);
+                }
+
+                result
+            },
+            ASTStatementKind::For => {
+                let loop_statement = statement as *mut ASTForStatement;
+                this.arena.New<ASTForStatement>(loop_statement->variable, this.CloneExpression(loop_statement->start), this.CloneExpression(loop_statement->end), this.CloneBlock(loop_statement->body), span)
+            }
+        }
+    }
+
+    fn CloneBlock(&mut this, block: *mut ASTBlockStatement) -> *mut ASTBlockStatement {
+        let result = this.arena.New<ASTBlockStatement>(block->span);
+
+        for child in block->statements {
+            result->statements.PushBack(this.CloneStatement(child));
+        }
+
+        result
     }
 
     fn CheckAssign(&mut this, statement: *mut ASTAssignStatement, scope: *mut Scope, context: Context) {
@@ -1596,7 +2460,8 @@ class Checker {
 
         let symbol = this.CheckTarget(statement->target, scope, context);
         if symbol == null { return; }
-        (statement->symbol, statement->whole) = (symbol, statement->target->kind == ASTExpressionKind::Path);
+        let element = statement->target->kind == ASTExpressionKind::Index && (statement->target as *mut ASTIndexExpression)->element != null;
+        (statement->symbol, statement->whole) = (symbol, statement->target->kind == ASTExpressionKind::Path || element);
         this.RecordDriver(symbol, if context == Context::Comb { DriverKind::Comb } else { DriverKind::Seq }, this.block, statement->span);
         let target = statement->target->resolved;
         if target == null || target->IsError() { return; }
@@ -1670,11 +2535,21 @@ class Checker {
             },
             ASTStatementKind::If => {
                 let conditional = statement as *mut ASTIfStatement;
+
+                if conditional->folded {
+                    if conditional->chosen != null { this.CollectAssigned(conditional->chosen, result); }
+                    return;
+                }
+
                 this.CollectAssigned(conditional->then, result);
                 if conditional->otherwise != null { this.CollectAssigned(conditional->otherwise, result); }
             },
             ASTStatementKind::Match => {
                 for arm in (statement as *mut ASTMatchStatement)->arms { this.CollectAssigned(arm->body, result); }
+            },
+            ASTStatementKind::For => {
+                let unrolled = (statement as *mut ASTForStatement)->unrolled;
+                if unrolled != null { this.CollectAssigned(unrolled, result); }
             }
         }
     }
@@ -1698,6 +2573,12 @@ class Checker {
             },
             ASTStatementKind::If => {
                 let conditional = statement as *mut ASTIfStatement;
+
+                if conditional->folded {
+                    if conditional->chosen == null { return Vector<*mut Symbol>(); }
+                    return this.Definite(conditional->chosen);
+                }
+
                 if conditional->otherwise == null { return Vector<*mut Symbol>(); }
                 Intersect(this.Definite(conditional->then), this.Definite(conditional->otherwise))
             },
@@ -1711,6 +2592,11 @@ class Checker {
                 }
 
                 result
+            },
+            ASTStatementKind::For => {
+                let unrolled = (statement as *mut ASTForStatement)->unrolled;
+                if unrolled == null { return Vector<*mut Symbol>(); }
+                this.Definite(unrolled)
             }
         }
     }

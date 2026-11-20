@@ -310,6 +310,21 @@ class Parser {
         }
 
         let instance = this.New<ASTInstanceExpression>(path->segments[0], path->span);
+
+        if this.Match(TokenType::Less) {
+            while !this.Check(TokenType::Greater) && !this.Check(TokenType::EndOfFile) {
+                let token = this.Current();
+                let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+                if !this.Expect(TokenType::Colon) { return null; }
+                let value = this.ParsePrimary(false);
+                if value == null { return null; }
+                instance->parameters.PushBack(this.arena->New<ASTConnection>(name, value, token.span));
+                if !this.Match(TokenType::Comma) { break; }
+            }
+
+            if !this.Expect(TokenType::Greater) { return null; }
+        }
+
         this.Expect(TokenType::LeftBrace);
 
         while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
@@ -374,6 +389,10 @@ class Parser {
                 this.Advance();
                 this.New<ASTBooleanLiteral>(token._type == TokenType::True, token.span)
             },
+            TokenType::String => {
+                this.Advance();
+                this.New<ASTStringLiteral>(this.lexer->Unescape(token.span), token.span)
+            },
             TokenType::Identifier => {
                 this.Advance();
 
@@ -396,7 +415,8 @@ class Parser {
                 let path = this.ParsePath(token);
                 if path == null { return null; }
 
-                if allow_instance && this.Check(TokenType::LeftBrace) {
+                if allow_instance && (this.Check(TokenType::LeftBrace) ||
+                    (this.Check(TokenType::Less) && this.Peek(1)._type == TokenType::Identifier && this.Peek(2)._type == TokenType::Colon)) {
                     return this.ParseInstance(path);
                 }
 
@@ -614,10 +634,24 @@ class Parser {
         statement
     }
 
+    fn ParseFor(&mut this) -> *mut ASTStatement {
+        let token = this.Advance();
+        let variable = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        if !this.Expect(TokenType::In) { return null; }
+        let start = this.ParseExpression();
+        if start == null || !this.Expect(TokenType::DotDot) { return null; }
+        let end = this.ParseExpression();
+        if end == null { return null; }
+        let body = this.ParseBlock();
+        if body == null { return null; }
+        this.New<ASTForStatement>(variable, start, end, body, token.span)
+    }
+
     fn ParseStatement(&mut this) -> *mut ASTStatement {
         match this.Current()._type {
             TokenType::LeftBrace => this.ParseBlock(),
             TokenType::If => this.ParseIf(),
+            TokenType::For => this.ParseFor(),
             TokenType::Match => this.ParseMatch(),
             TokenType::Let | TokenType::Wire | TokenType::Reg => {
                 this.Error("Signals must be declared at module level, not inside a block.".ToString());
@@ -716,14 +750,15 @@ class Parser {
         if !this.Expect(TokenType::Colon) { return null; }
         let direction = this.Current();
         let input = direction._type == TokenType::In;
+        let bidirectional = direction._type == TokenType::Inout;
 
-        if !input && direction._type != TokenType::Out {
-            this.Error("Expected 'in' or 'out', found " + direction.Describe() + ".");
+        if !input && !bidirectional && direction._type != TokenType::Out {
+            this.Error("Expected 'in', 'out' or 'inout', found " + direction.Describe() + ".");
             return null;
         }
 
         this.Advance();
-        let registered = !input && this.Match(TokenType::Reg);
+        let registered = !input && !bidirectional && this.Match(TokenType::Reg);
         let declared = this.ParseType();
         if declared == null { return null; }
         let mut init: *mut ASTExpression = null;
@@ -733,7 +768,9 @@ class Parser {
             if init == null { return null; }
         }
 
-        this.New<ASTPort>(name, input, registered, declared, init, token.span)
+        let port = this.New<ASTPort>(name, input, registered, declared, init, token.span);
+        port->bidirectional = bidirectional;
+        port
     }
 
     fn ParseModule(&mut this) -> *mut ASTItem {
@@ -742,11 +779,34 @@ class Parser {
         if !this.Expect(TokenType::Module) { return null; }
         let name = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
         let module = this.New<ASTModuleItem>(name, external, token.span);
+
+        if this.Match(TokenType::Less) {
+            while !this.Check(TokenType::Greater) && !this.Check(TokenType::EndOfFile) {
+                match this.ExpectIdentifier() {
+                    Option<String>::Some(parameter) => module->parameters.PushBack(parameter),
+                    Option<String>::None => { return null; }
+                }
+
+                if !this.Match(TokenType::Comma) { break; }
+            }
+
+            if !this.Expect(TokenType::Greater) { return null; }
+        }
+
         if !this.Expect(TokenType::LeftParen) { return null; }
 
         while !this.Check(TokenType::RightParen) && !this.Check(TokenType::EndOfFile) {
+            let mut condition: *mut ASTExpression = null;
+
+            if this.Match(TokenType::PreprocessorStart) {
+                if !this.Expect(TokenType::If) { return null; }
+                condition = this.ParseExpression();
+                if condition == null || !this.Expect(TokenType::RightBracket) { return null; }
+            }
+
             let port = this.ParsePort();
             if port == null { return null; }
+            port->condition = condition;
             module->ports.PushBack(port);
             if !this.Match(TokenType::Comma) { break; }
         }
@@ -834,6 +894,58 @@ class Parser {
         this.New<ASTSeqItem>(clock, reset, body, token.span)
     }
 
+    fn ParseModuleItems(&mut this, items: &mut Vector<*mut ASTItem>) -> bool {
+        if !this.Expect(TokenType::LeftBrace) { return false; }
+
+        while !this.Check(TokenType::RightBrace) && !this.Check(TokenType::EndOfFile) {
+            if this.Match(TokenType::Semicolon) { continue; }
+            let before = this.Current().span.start;
+            let item = this.ParseModuleItem();
+
+            if item == null {
+                this.Recover(before);
+                continue;
+            }
+
+            items.PushBack(item);
+        }
+
+        this.Expect(TokenType::RightBrace)
+    }
+
+    fn ParseModuleFor(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let variable = match this.ExpectIdentifier() { Option<String>::Some(name) => name, Option<String>::None => { return null; } };
+        if !this.Expect(TokenType::In) { return null; }
+        let start = this.ParseExpression();
+        if start == null || !this.Expect(TokenType::DotDot) { return null; }
+        let end = this.ParseExpression();
+        if end == null { return null; }
+        let item = this.New<ASTForItem>(variable, start, end, token.span);
+        if !this.ParseModuleItems(item->items) { return null; }
+        item
+    }
+
+    fn ParseModuleIf(&mut this) -> *mut ASTItem {
+        let token = this.Advance();
+        let condition = this.ParseExpression();
+        if condition == null { return null; }
+        let item = this.New<ASTIfItem>(condition, token.span);
+        if !this.ParseModuleItems(item->then) { return null; }
+
+        if this.Match(TokenType::Else) {
+            if this.Check(TokenType::If) {
+                let nested = this.ParseModuleIf();
+                if nested == null { return null; }
+                item->otherwise.PushBack(nested);
+            } else if !this.ParseModuleItems(item->otherwise) {
+                return null;
+            }
+        }
+
+        item
+    }
+
     fn ParseModuleItem(&mut this) -> *mut ASTItem {
         let token = this.Current();
 
@@ -853,8 +965,10 @@ class Parser {
                 this.Error("Modules cannot be nested.".ToString());
                 null
             },
-            TokenType::If | TokenType::Match => {
-                this.Error("'" + token.Text() + "' is only allowed inside 'comb' and 'seq' blocks.");
+            TokenType::For => this.ParseModuleFor(),
+            TokenType::If => this.ParseModuleIf(),
+            TokenType::Match => {
+                this.Error("'match' is only allowed inside 'comb' and 'seq' blocks.".ToString());
                 null
             },
             _ => {

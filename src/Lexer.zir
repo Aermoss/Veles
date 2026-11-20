@@ -214,6 +214,7 @@ class Lexer {
             '}' => (TokenType::RightBrace, 1),
             '[' => (TokenType::LeftBracket, 1),
             ']' => (TokenType::RightBracket, 1),
+            '.' if next == '.' => (TokenType::DotDot, 2),
             '.' => (TokenType::Dot, 1),
             ',' => (TokenType::Comma, 1),
             ';' => (TokenType::Semicolon, 1),

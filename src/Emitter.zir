@@ -28,7 +28,15 @@ fn IsSystemVerilogKeyword(name: &String) -> bool {
         "join local localparam logic longint macromodule module nand negedge new nor not null or output package packed " +
         "parameter posedge primitive priority program real reg release repeat return shortint signed static string " +
         "struct super supply0 supply1 table task this time tri typedef union unique unsigned var void wait wand while " +
-        "wire wor xnor xor";
+        "wire wor xnor xor accept_on alias bind bins binsof break cell chandle checker clocking config constraint context cover covergroup " +
+        "coverpoint cross deassign design dist endchecker endclocking endconfig endgroup endproperty endsequence endspecify " +
+        "eventually expect extends first_match global highz0 highz1 ignore_bins illegal_bins implements implies import incdir include " +
+        "instance interconnect intersect join_any join_none large let liblist library matches medium modport nettype nexttime nmos " +
+        "noshowcancelled notif0 notif1 pmos property protected pull0 pull1 pulldown pullup pulsestyle_ondetect pulsestyle_onevent pure " +
+        "rand randc randcase randsequence rcmos ref reject_on restrict rnmos rpmos rtran rtranif0 rtranif1 s_always s_eventually " +
+        "s_nexttime s_until s_until_with scalared sequence showcancelled small soft solve specify specparam strong strong0 strong1 " +
+        "sync_accept_on sync_reject_on tagged throughout timeprecision timeunit tran tranif0 tranif1 tri0 tri1 triand trior trireg " +
+        "type union unique0 until until_with untyped use uwire vectored virtual wait_order weak weak0 weak1 wildcard with within";
 
     for keyword in keywords.Split(' ') {
         if keyword == name { return true; }
@@ -45,10 +53,12 @@ class Emitter {
     checker: *mut Checker = null,
     used: Vector<String>,
     outputs: Map<String, String>,
+    aliases: Vector<*mut Symbol>,
     temps: Map<String, String>,
     temp_declarations: String,
     temp_assignments: String,
-    temp_counter: u32 = 0;
+    temp_counter: u32 = 0,
+    procedural: bool = false;
 
     Emitter(&mut this, checker: *mut Checker) {
         this.checker = checker;
@@ -145,7 +155,19 @@ class Emitter {
 
         match expression->kind {
             ASTExpressionKind::Path | ASTExpressionKind::Member => true,
-            ASTExpressionKind::Index => (expression as *mut ASTIndexExpression)->base->resolved->IsArray(),
+            ASTExpressionKind::Index => {
+                let index = expression as *mut ASTIndexExpression;
+                if index->element != null { return this.IsSelectable(index->element); }
+                index->choices.Empty() && index->base->resolved->IsArray()
+            },
+            ASTExpressionKind::If => {
+                let conditional = expression as *mut ASTIfExpression;
+                conditional->chosen != null && this.IsSelectable(conditional->chosen)
+            },
+            ASTExpressionKind::Binary => {
+                let binary = expression as *mut ASTBinaryExpression;
+                binary->folded != null && this.IsSelectable(binary->folded)
+            },
             _ => false
         }
     }
@@ -180,6 +202,7 @@ class Emitter {
             },
             ASTExpressionKind::Binary => {
                 let binary = expression as *mut ASTBinaryExpression;
+                if binary->folded != null { return this.Expression(binary->folded, top); }
                 let left = this.Expression(binary->left, false);
                 let right = this.Expression(binary->right, false);
                 let mut op = binary->op.Text();
@@ -193,11 +216,27 @@ class Emitter {
             },
             ASTExpressionKind::Index => {
                 let index = expression as *mut ASTIndexExpression;
+                if index->element != null { return this.Expression(index->element, top); }
+                if !index->choices.Empty() { return this.Select(index, top); }
+                if index->base->resolved->IsBits() && index->base->resolved->width == 1 { return this.Expression(index->base, top); }
+
+                if this.procedural && !this.IsSelectable(index->base) {
+                    return "1'({" + this.Expression(index->base, true) + "} >> " + this.Expression(index->index, false) + ")";
+                }
+
                 let base = this.Selectable(index->base);
                 base + "[" + this.Expression(index->index, true) + "]"
             },
             ASTExpressionKind::Slice => {
                 let slice = expression as *mut ASTSliceExpression;
+
+                if this.procedural && !this.IsSelectable(slice->base) {
+                    let width = String::FromInteger(slice->high_value - slice->low_value + 1);
+                    let value = "{" + this.Expression(slice->base, true) + "}";
+                    if slice->low_value == 0 { return width + "'(" + value + ")"; }
+                    return width + "'(" + value + " >> " + String::FromInteger(slice->low_value) + ")";
+                }
+
                 let base = this.Selectable(slice->base);
                 base + "[" + String::FromInteger(slice->high_value) + ":" + String::FromInteger(slice->low_value) + "]"
             },
@@ -205,6 +244,7 @@ class Emitter {
             ASTExpressionKind::Cast => this.Cast(expression as *mut ASTCastExpression, top),
             ASTExpressionKind::If => {
                 let conditional = expression as *mut ASTIfExpression;
+                if conditional->chosen != null { return this.Expression(conditional->chosen, top); }
                 let condition = this.Expression(conditional->condition, false);
                 let then = this.Expression(conditional->then, false);
                 let otherwise = this.Expression(conditional->otherwise, false);
@@ -218,6 +258,26 @@ class Emitter {
             },
             _ => "/* unsupported */".ToString()
         }
+    }
+
+    fn Select(&mut this, index: *mut ASTIndexExpression, top: bool) -> String {
+        let selector = this.Expression(index->index, false);
+        let start = index->base->resolved->group->value;
+        let last = index->choices.Length() - 1;
+        let mut text = this.Expression(index->choices[last], false);
+        let mut position = last;
+
+        while position > 0 {
+            position -= 1;
+            let label = this.Literal(start + position as i64, index->index->resolved, 10);
+            text = selector + " == " + label + " ? " + this.Expression(index->choices[position], false) + " : " + text;
+        }
+
+        if index->resolved->IsEnum() {
+            return SafeName(index->resolved->enumeration->name) + "'(" + text + ")";
+        }
+
+        if top || last == 0 { text } else { "(" + text + ")" }
     }
 
     fn Call(&mut this, call: *mut ASTCallExpression, top: bool) -> String {
@@ -263,7 +323,10 @@ class Emitter {
             return (if target->signed { "$signed(" } else { "$unsigned(" }) + text + ")";
         }
 
-        if width < source_width {
+        if this.procedural && !this.IsSelectable(operand) && (width < source_width || source_signed) {
+            let value = "{" + this.Expression(operand, true) + "}";
+            text = String::FromInteger(width as u64) + "'(" + (if width > source_width { "$signed(" + value + ")" } else { value }) + ")";
+        } else if width < source_width {
             let base = this.Selectable(operand);
             text = base + (if width == 1 { "[0]".ToString() } else { "[" + String::FromInteger((width - 1) as u64) + ":0]" });
         } else {
@@ -285,6 +348,8 @@ class Emitter {
         match target->kind {
             ASTExpressionKind::Index => {
                 let index = target as *mut ASTIndexExpression;
+                if index->element != null { return this.Target(index->element); }
+                if index->base->resolved != null && index->base->resolved->IsBits() && index->base->resolved->width == 1 { return this.Target(index->base); }
                 this.Target(index->base) + "[" + this.Expression(index->index, true) + "]"
             },
             ASTExpressionKind::Slice => {
@@ -308,7 +373,15 @@ class Emitter {
                 let value = this.Expression(assign->value, true);
                 output += indent + target + (if assign->nonblocking { " <= " } else { " = " }) + value + ";\n";
             },
-            ASTStatementKind::If => this.If(statement as *mut ASTIfStatement, indent, output, false),
+            ASTStatementKind::If => {
+                let conditional = statement as *mut ASTIfStatement;
+
+                if conditional->folded {
+                    if conditional->chosen != null { this.Statement(conditional->chosen, indent, output); }
+                } else {
+                    this.If(conditional, indent, output, false);
+                }
+            },
             ASTStatementKind::Match => {
                 let matching = statement as *mut ASTMatchStatement;
                 output += indent + "case (" + this.Expression(matching->scrutinee, true) + ")\n";
@@ -332,6 +405,10 @@ class Emitter {
                 }
 
                 output += indent + "endcase\n";
+            },
+            ASTStatementKind::For => {
+                let unrolled = (statement as *mut ASTForStatement)->unrolled;
+                if unrolled != null { this.Statement(unrolled, indent, output); }
             }
         }
     }
@@ -347,14 +424,27 @@ class Emitter {
             return;
         }
 
-        if statement->otherwise->kind == ASTStatementKind::If {
-            output += " else ";
-            this.If(statement->otherwise as *mut ASTIfStatement, indent, output, true);
-            return;
+        let mut otherwise = statement->otherwise;
+
+        if otherwise->kind == ASTStatementKind::If {
+            let nested = otherwise as *mut ASTIfStatement;
+
+            if !nested->folded {
+                output += " else ";
+                this.If(nested, indent, output, true);
+                return;
+            }
+
+            if nested->chosen == null {
+                output += "\n";
+                return;
+            }
+
+            otherwise = nested->chosen;
         }
 
         output += " else begin\n";
-        this.Statement(statement->otherwise, indent + Pad(1), output);
+        this.Statement(otherwise, indent + Pad(1), output);
         output += indent + "end\n";
     }
 
@@ -373,7 +463,21 @@ class Emitter {
     fn Instance(&mut this, symbol: *mut Symbol) -> String {
         let instance = symbol->instance;
         let module = symbol->module;
-        let mut text = Pad(1) + SafeName(module->name) + " " + SafeName(symbol->name) + " (\n";
+        let mut text = Pad(1) + SafeName(module->name);
+
+        if !instance->parameters.Empty() {
+            text += " #(\n";
+
+            for i in 0..instance->parameters.Length() {
+                let parameter = instance->parameters[i];
+                text += Pad(2) + "." + parameter->name + "(" + parameter->text + ")";
+                text += if i + 1 < instance->parameters.Length() { ",\n" } else { "\n" };
+            }
+
+            text += Pad(1) + ")";
+        }
+
+        text += " " + SafeName(symbol->name) + " (\n";
 
         for i in 0..module->ports.Length() {
             let port = module->ports[i];
@@ -421,6 +525,7 @@ class Emitter {
     fn Module(&mut this, module: *mut ModuleInfo) -> String {
         this.used.Clear();
         this.outputs.Clear();
+        this.aliases.Clear();
         this.temps.Clear();
         (this.temp_declarations, this.temp_assignments, this.temp_counter) = (String(), String(), 0);
         let item = module->item;
@@ -429,11 +534,25 @@ class Emitter {
         for symbol in module->signals { this.used.PushBack(SafeName(symbol->name)); }
 
         for symbol in module->signals {
+            if symbol->kind != SymbolKind::Let { continue; }
+            let signal = symbol->node as *mut ASTSignalItem;
+            if signal->value == null || signal->value->kind != ASTExpressionKind::Member { continue; }
+            let member = signal->value as *mut ASTMemberExpression;
+            if member->instance == null || member->port == null { continue; }
+            let key = member->instance->name + "." + member->port->name;
+            if this.outputs.Has(key) { continue; }
+            this.outputs[key] = SafeName(symbol->name);
+            this.aliases.PushBack(symbol);
+        }
+
+        for symbol in module->signals {
             if symbol->kind != SymbolKind::Instance { continue; }
 
             for port in symbol->module->ports {
-                if !port->input {
-                    this.outputs[symbol->name + "." + port->name] = this.Reserve(symbol->name + "_" + port->name);
+                let key = symbol->name + "." + port->name;
+
+                if !port->input && !this.outputs.Has(key) {
+                    this.outputs[key] = this.Reserve(symbol->name + "_" + port->name);
                 }
             }
         }
@@ -447,7 +566,14 @@ class Emitter {
 
             for i in 0..module->ports.Length() {
                 let port = module->ports[i];
-                text += Pad(1) + (if port->input { "input " } else { "output " }) + this.Declaration(port->_type, SafeName(port->name));
+                let declaration = this.Declaration(port->_type, SafeName(port->name));
+
+                if port->bidirectional {
+                    text += Pad(1) + "inout wire" + declaration.SubString(5);
+                } else {
+                    text += Pad(1) + (if port->input { "input " } else { "output " }) + declaration;
+                }
+
                 text += if i + 1 < module->ports.Length() { ",\n" } else { "\n" };
             }
 
@@ -466,6 +592,7 @@ class Emitter {
                 continue;
             }
 
+            if this.aliases.Contains(symbol) { continue; }
             let mut line = Pad(1) + this.Declaration(symbol->_type, SafeName(symbol->name));
             if symbol->power_on { line += " = " + this.Expression(symbol->init, true); }
             declarations += line + ";\n";
@@ -477,10 +604,14 @@ class Emitter {
             if port->power_on { initials += Pad(1) + "initial " + SafeName(port->name) + " = " + this.Expression(port->init, true) + ";\n"; }
         }
 
+        for symbol in module->signals {
+            if !symbol->memory_file.Empty() { initials += Pad(1) + "initial $readmemh(\"" + symbol->memory_file + "\", " + SafeName(symbol->name) + ");\n"; }
+        }
+
         let mut assigns = String();
         let mut body = String();
 
-        for child in item->items {
+        for child in module->elaborated {
             match child->kind {
                 ASTItemKind::Signal => {
                     let signal = child as *mut ASTSignalItem;
@@ -488,7 +619,7 @@ class Emitter {
 
                     if symbol->kind == SymbolKind::Instance {
                         body += "\n" + this.Instance(symbol);
-                    } else if symbol->kind == SymbolKind::Let {
+                    } else if symbol->kind == SymbolKind::Let && !this.aliases.Contains(symbol) {
                         assigns += Pad(1) + "assign " + SafeName(symbol->name) + " = " + this.Expression(signal->value, true) + ";\n";
                     }
                 },
@@ -498,11 +629,15 @@ class Emitter {
                 },
                 ASTItemKind::Comb => {
                     let mut block = Pad(1) + "always_comb begin\n";
+                    this.procedural = true;
                     this.Statement((child as *mut ASTCombItem)->body, Pad(2), block);
+                    this.procedural = false;
                     body += "\n" + block + Pad(1) + "end\n";
                 },
                 ASTItemKind::Seq => {
+                    this.procedural = true;
                     body += "\n" + this.Seq(child as *mut ASTSeqItem);
+                    this.procedural = false;
                 },
                 _ => {}
             }
@@ -514,15 +649,52 @@ class Emitter {
         text + sections + body + "endmodule\n"
     }
 
+    fn UsesEnum(&this, module: *mut ModuleInfo, info: *mut EnumInfo) -> bool {
+        let mut symbols = module->ports;
+        symbols += module->signals;
+
+        for symbol in symbols {
+            let mut _type = symbol->_type;
+            if _type != null && _type->IsArray() { _type = _type->element; }
+            if _type != null && _type->IsEnum() && _type->enumeration == info { return true; }
+        }
+
+        false
+    }
+
     pub fn Emit(&mut this, source: &String) -> String {
         let mut text = "// Generated by Veles from " + source + ". Do not edit.\n";
+        let mut used = Vector<*mut ModuleInfo>();
+
+        for module in this.checker->modules {
+            if this.checker->root == null || this.checker->root->items.Contains(module->item as *mut ASTItem) { used.PushBack(module); }
+        }
+
+        let mut next: usize = 0;
+
+        while next < used.Length() {
+            let module = used[next];
+            next += 1;
+
+            for symbol in module->signals {
+                if symbol->kind == SymbolKind::Instance && symbol->module != null && !used.Contains(symbol->module) {
+                    used.PushBack(symbol->module);
+                }
+            }
+        }
 
         for info in this.checker->enums {
-            text += "\n" + this.Enum(info, String());
+            let mut needed = false;
+
+            for module in used {
+                if !module->item->external && this.UsesEnum(module, info) { needed = true; }
+            }
+
+            if needed { text += "\n" + this.Enum(info, String()); }
         }
 
         for module in this.checker->modules {
-            if module->item->external { continue; }
+            if module->item->external || !used.Contains(module) { continue; }
             text += "\n" + this.Module(module);
         }
 

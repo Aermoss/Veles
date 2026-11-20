@@ -1,0 +1,278 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "tool/System.zir", "tool/Config.zir" : *]
+
+class Board {
+    pub name: String,
+    pub device: String,
+    pub part: String,
+    pub family: String,
+    pub synthesis: String,
+    pub loader: String,
+    pub cable: String,
+    pub flash_operation: String,
+    pub image_operation: String,
+    pub frequency: String,
+    pub clock_pin: String,
+    pub clock_mhz: String,
+    pub led_pins: Vector<String>,
+    pub led_type: String;
+
+    Board(&mut this) {}
+}
+
+fn KnownBoards() -> Vector<Board> {
+    let mut boards = Vector<Board>();
+    let mut nano20k = Board();
+    nano20k.name = "tangnano20k".ToString();
+    nano20k.device = "GW2AR-LV18QN88C8/I7".ToString();
+    nano20k.part = "GW2AR-18C".ToString();
+    nano20k.family = "GW2A-18C".ToString();
+    nano20k.synthesis = "gw2a".ToString();
+    nano20k.loader = "tangnano20k".ToString();
+    nano20k.cable = "1".ToString();
+    nano20k.flash_operation = "36".ToString();
+    nano20k.image_operation = "39".ToString();
+    nano20k.clock_pin = "4".ToString();
+    nano20k.clock_mhz = "27".ToString();
+    nano20k.led_type = "LVCMOS33".ToString();
+
+    for pin in "15 16 17 18 19 20".ToString().Split(' ') {
+        nano20k.led_pins.PushBack(pin);
+    }
+
+    boards.PushBack(nano20k);
+    boards
+}
+
+fn FindBoard(name: &String) -> Option<Board> {
+    for board in KnownBoards() {
+        if board.name == name { return Option<Board>::Some(board); }
+    }
+
+    Option<Board>::None
+}
+
+fn BoardNames() -> String {
+    let mut names = String();
+
+    for board in KnownBoards() {
+        if !names.Empty() { names += ", "; }
+        names += board.name;
+    }
+
+    names
+}
+
+fn Existing(path: &String) -> String {
+    if FileExists(path) { Slashes(path) } else { String() }
+}
+
+fn FirstFile(candidates: &Vector<String>) -> String {
+    for candidate in candidates {
+        if !candidate.Empty() && FileExists(candidate) { return Slashes(candidate); }
+    }
+
+    String()
+}
+
+fn GowinShell(location: &String) -> String {
+    if location.Empty() { return String(); }
+    let mut candidates = Vector<String>();
+    candidates.PushBack(String(location));
+    candidates.PushBack(Join(location, "IDE/bin/gw_sh.exe".ToString()));
+    candidates.PushBack(Join(location, "bin/gw_sh.exe".ToString()));
+    let found = FirstFile(candidates);
+    if found.EndsWith(".exe") { found } else { String() }
+}
+
+fn InstalledGowin() -> String {
+    let mut found = String();
+
+    if let Result<Vector<FolderEntry>, IOError>::Ok(entries) = ListFolder("C:/Gowin".ToString()) {
+        for entry in entries {
+            if entry.kind != EntryKind::Folder || entry.name.StartsWith('.') { continue; }
+            let shell = GowinShell(Join("C:/Gowin".ToString(), entry.name));
+            if !shell.Empty() { found = shell; }
+        }
+    }
+
+    found
+}
+
+fn MsysRoot(location: &String) -> String {
+    if !location.Empty() && FileExists(Join(location, "ucrt64/bin/g++.exe".ToString())) && FileExists(Join(location, "usr/bin/sh.exe".ToString())) {
+        Slashes(location)
+    } else {
+        String()
+    }
+}
+
+fn DownloadedSurfer(home: &String) -> String {
+    let downloads = Join(home, "Downloads".ToString());
+    let mut found = String();
+
+    if let Result<Vector<FolderEntry>, IOError>::Ok(entries) = ListFolder(downloads) {
+        for entry in entries {
+            if entry.kind == EntryKind::Folder && entry.name.ToLower().StartsWith("surfer") {
+                let candidate = Existing(Join(Join(downloads, entry.name), "surfer.exe".ToString()));
+                if !candidate.Empty() { found = candidate; }
+            }
+        }
+    }
+
+    found
+}
+
+fn SuiteRoot(location: &String) -> String {
+    if !location.Empty() && FileExists(Join(location, "bin/yosys.exe".ToString())) { Slashes(location) } else { String() }
+}
+
+class Tools {
+    pub velesc: String,
+    pub gowin: String,
+    pub programmer: String,
+    pub suite: String,
+    pub yosys: String,
+    pub nextpnr: String,
+    pub pack: String,
+    pub iverilog: String,
+    pub vvp: String,
+    pub gtkwave: String,
+    pub surfer: String,
+    pub loader: String,
+    pub verilator: String,
+    pub msys: String,
+    plain_path: String,
+    suite_path: String,
+    verilator_path: String;
+
+    Tools(&mut this) {}
+
+    pub fn UseSuite(&this, enabled: bool) {
+        if !this.suite.Empty() { SetEnvironment("PATH", if enabled { this.suite_path } else { this.plain_path }); }
+    }
+
+    pub fn UseVerilator(&this, enabled: bool) {
+        if !this.HasVerilator() { return; }
+        SetEnvironment("PATH", if enabled { this.verilator_path } else { this.plain_path });
+
+        if enabled {
+            SetEnvironment("MAKE", "mingw32-make".ToString());
+            SetEnvironment("VERILATOR_ROOT", Join(this.suite, "share/verilator".ToString()));
+        }
+    }
+
+    pub fn HasVerilator(&this) -> bool {
+        !this.verilator.Empty() && !this.msys.Empty() && !this.suite.Empty()
+    }
+
+    pub fn Find(&mut this, config: &Config) {
+        let tools = "tools".ToString();
+        let mut compilers = Vector<String>();
+
+        if let Result<String, IOError>::Ok(executable) = ExecutablePath() {
+            compilers.PushBack(Join(Parent(Slashes(executable)), "velesc.exe".ToString()));
+        }
+
+        compilers.PushBack(FindInPath("velesc.exe"));
+        this.velesc = FirstFile(compilers);
+
+        this.gowin = GowinShell(config.Get(tools, "gowin"));
+        if this.gowin.Empty() { this.gowin = GowinShell(Environment("GOWIN_HOME")); }
+        if this.gowin.Empty() { this.gowin = FindInPath("gw_sh.exe"); }
+        if this.gowin.Empty() { this.gowin = InstalledGowin(); }
+        this.programmer = Existing(config.Get(tools, "programmer"));
+
+        if this.programmer.Empty() && !this.gowin.Empty() {
+            this.programmer = Existing(Join(Parent(Parent(Parent(this.gowin))), "Programmer/bin/programmer_cli.exe".ToString()));
+        }
+
+        let home = Environment("USERPROFILE");
+        this.plain_path = Environment("PATH");
+        this.suite = SuiteRoot(config.Get(tools, "oss"));
+        if this.suite.Empty() { this.suite = SuiteRoot(Environment("OSS_CAD_SUITE")); }
+
+        if this.suite.Empty() {
+            let yosys = FindInPath("yosys.exe");
+            if !yosys.Empty() { this.suite = SuiteRoot(Parent(Parent(yosys))); }
+        }
+
+        if this.suite.Empty() { this.suite = SuiteRoot(Join(home, "oss-cad-suite".ToString())); }
+        if this.suite.Empty() { this.suite = SuiteRoot(Join(home, "Downloads/oss-cad-suite".ToString())); }
+        if this.suite.Empty() { this.suite = SuiteRoot("C:/oss-cad-suite".ToString()); }
+
+        if !this.suite.Empty() {
+            let bin = Join(this.suite, "bin".ToString());
+            let lib = Join(this.suite, "lib".ToString());
+            this.suite_path = Native(bin) + ";" + Native(lib) + ";" + this.plain_path;
+            let suite = Native(this.suite) + "\\";
+            SetEnvironment("GTK_EXE_PREFIX", suite);
+            SetEnvironment("GTK_DATA_PREFIX", suite);
+            SetEnvironment("GDK_PIXBUF_MODULEDIR", suite + "lib\\gdk-pixbuf-2.0\\2.10.0\\loaders");
+            SetEnvironment("GDK_PIXBUF_MODULE_FILE", suite + "lib\\gdk-pixbuf-2.0\\2.10.0\\loaders.cache");
+            SetEnvironment("OPENFPGALOADER_SOJ_DIR", suite + "share\\openFPGALoader");
+            this.yosys = Existing(Join(bin, "yosys.exe".ToString()));
+            this.nextpnr = Existing(Join(bin, "nextpnr-himbaechel.exe".ToString()));
+            this.pack = Existing(Join(bin, "gowin_pack.exe".ToString()));
+            this.verilator = Existing(Join(bin, "verilator_bin.exe".ToString()));
+        }
+
+        this.msys = MsysRoot(config.Get(tools, "msys"));
+        if this.msys.Empty() { this.msys = MsysRoot(Environment("MSYS2_ROOT")); }
+        if this.msys.Empty() { this.msys = MsysRoot("C:/msys64".ToString()); }
+
+        if this.HasVerilator() {
+            this.verilator_path = Native(Join(this.msys, "ucrt64/bin".ToString())) + ";" + Native(Join(this.msys, "usr/bin".ToString())) + ";" + this.suite_path;
+        }
+
+        this.surfer = Existing(config.Get(tools, "surfer"));
+        if this.surfer.Empty() { this.surfer = FindInPath("surfer.exe"); }
+        if this.surfer.Empty() { this.surfer = Existing(Join(home, "surfer/surfer.exe".ToString())); }
+        if this.surfer.Empty() { this.surfer = DownloadedSurfer(home); }
+
+        this.iverilog = this.Program("iverilog.exe");
+        this.vvp = this.Program("vvp.exe");
+        this.gtkwave = this.Program("gtkwave.exe");
+        this.loader = this.Program("openFPGALoader.exe");
+    }
+
+    fn Program(&this, name: *i8) -> String {
+        let mut candidates = Vector<String>();
+        if !this.suite.Empty() { candidates.PushBack(Join(Join(this.suite, "bin".ToString()), name.ToString())); }
+        candidates.PushBack(FindInPath(name));
+        candidates.PushBack(Join("C:/msys64/ucrt64/bin".ToString(), name.ToString()));
+        FirstFile(candidates)
+    }
+
+    pub fn HasOpen(&this) -> bool {
+        !this.yosys.Empty() && !this.nextpnr.Empty() && !this.pack.Empty()
+    }
+
+    pub fn Show(&this) {
+        WriteLine("velesc            " + (if this.velesc.Empty() { "not found".ToString() } else { String(this.velesc) }));
+        WriteLine("gowin             " + (if this.gowin.Empty() { "not found".ToString() } else { String(this.gowin) }));
+        WriteLine("gowin programmer  " + (if this.programmer.Empty() { "not found".ToString() } else { String(this.programmer) }));
+        WriteLine("oss-cad-suite     " + (if this.suite.Empty() { "not found".ToString() } else { String(this.suite) }));
+        WriteLine("iverilog          " + (if this.iverilog.Empty() { "not found".ToString() } else { String(this.iverilog) }));
+        WriteLine("verilator         " + (if this.verilator.Empty() { "not found".ToString() } else { String(this.verilator) }));
+        WriteLine("msys2 (C++)       " + (if this.msys.Empty() { "not found".ToString() } else { String(this.msys) }));
+        WriteLine("surfer            " + (if this.surfer.Empty() { "not found".ToString() } else { String(this.surfer) }));
+        WriteLine("gtkwave           " + (if this.gtkwave.Empty() { "not found".ToString() } else { String(this.gtkwave) }));
+        WriteLine("openFPGALoader    " + (if this.loader.Empty() { "not found".ToString() } else { String(this.loader) }));
+    }
+}

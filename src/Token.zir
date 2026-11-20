@@ -21,8 +21,8 @@ enum TokenType: u8 {
 
     Identifier, Integer, String,
 
-    Module, Extern, Enum, Type, Const, Let, Wire, Reg, In, Out,
-    Seq, Comb, If, Else, Match, As, True, False,
+    Module, Extern, Enum, Type, Const, Let, Wire, Reg, In, Out, Inout,
+    Seq, Comb, If, Else, Match, For, As, True, False,
 
     Assign, NonBlocking,
 
@@ -31,7 +31,7 @@ enum TokenType: u8 {
     Equal, NotEqual, Greater, Less, GreaterEqual, LessEqual,
 
     LeftParen, RightParen, LeftBrace, RightBrace, LeftBracket, RightBracket,
-    Dot, Comma, Colon, DoubleColon, Semicolon, Arrow, FatArrow,
+    Dot, DotDot, Comma, Colon, DoubleColon, Semicolon, Arrow, FatArrow,
 
     PreprocessorStart
 }
@@ -54,11 +54,13 @@ extend TokenType {
             TokenType::Reg => "'reg'",
             TokenType::In => "'in'",
             TokenType::Out => "'out'",
+            TokenType::Inout => "'inout'",
             TokenType::Seq => "'seq'",
             TokenType::Comb => "'comb'",
             TokenType::If => "'if'",
             TokenType::Else => "'else'",
             TokenType::Match => "'match'",
+            TokenType::For => "'for'",
             TokenType::As => "'as'",
             TokenType::True => "'true'",
             TokenType::False => "'false'",
@@ -90,6 +92,7 @@ extend TokenType {
             TokenType::LeftBracket => "'['",
             TokenType::RightBracket => "']'",
             TokenType::Dot => "'.'",
+            TokenType::DotDot => "'..'",
             TokenType::Comma => "','",
             TokenType::Colon => "':'",
             TokenType::DoubleColon => "'::'",
@@ -112,11 +115,13 @@ fn StringToKeyword(string: &String) -> TokenType {
     else if string == "reg" { TokenType::Reg }
     else if string == "in" { TokenType::In }
     else if string == "out" { TokenType::Out }
+    else if string == "inout" { TokenType::Inout }
     else if string == "seq" { TokenType::Seq }
     else if string == "comb" { TokenType::Comb }
     else if string == "if" { TokenType::If }
     else if string == "else" { TokenType::Else }
     else if string == "match" { TokenType::Match }
+    else if string == "for" { TokenType::For }
     else if string == "as" { TokenType::As }
     else if string == "true" { TokenType::True }
     else if string == "false" { TokenType::False }

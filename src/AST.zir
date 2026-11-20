@@ -70,7 +70,7 @@ class ASTArrayType : ASTType {
 }
 
 enum ASTExpressionKind: u8 {
-    Integer, Boolean, Path, Unary, Binary, Index, Slice, Member, Call, Cast, If, Instance
+    Integer, Boolean, String, Path, Unary, Binary, Index, Slice, Member, Call, Cast, If, Instance
 }
 
 class ASTExpression : ASTNode {
@@ -98,6 +98,14 @@ class ASTBooleanLiteral : ASTExpression {
 
     ASTBooleanLiteral(&mut this, literal: bool, span: SourceSpan) : ASTExpression(ASTExpressionKind::Boolean, span) {
         this.literal = literal;
+    }
+}
+
+class ASTStringLiteral : ASTExpression {
+    pub text: String;
+
+    ASTStringLiteral(&mut this, text: &String, span: SourceSpan) : ASTExpression(ASTExpressionKind::String, span) {
+        this.text = text;
     }
 }
 
@@ -180,7 +188,8 @@ extend ASTBinaryKind {
 class ASTBinaryExpression : ASTExpression {
     pub op: ASTBinaryKind,
     pub left: *mut ASTExpression,
-    pub right: *mut ASTExpression;
+    pub right: *mut ASTExpression,
+    pub folded: *mut ASTExpression = null;
 
     ASTBinaryExpression(&mut this, op: ASTBinaryKind, left: *mut ASTExpression, right: *mut ASTExpression, span: SourceSpan) : ASTExpression(ASTExpressionKind::Binary, span) {
         (this.op, this.left, this.right) = (op, left, right);
@@ -189,7 +198,9 @@ class ASTBinaryExpression : ASTExpression {
 
 class ASTIndexExpression : ASTExpression {
     pub base: *mut ASTExpression,
-    pub index: *mut ASTExpression;
+    pub index: *mut ASTExpression,
+    pub element: *mut ASTExpression = null,
+    pub choices: Vector<*mut ASTExpression>;
 
     ASTIndexExpression(&mut this, base: *mut ASTExpression, index: *mut ASTExpression, span: SourceSpan) : ASTExpression(ASTExpressionKind::Index, span) {
         (this.base, this.index) = (base, index);
@@ -240,7 +251,8 @@ class ASTCastExpression : ASTExpression {
 class ASTIfExpression : ASTExpression {
     pub condition: *mut ASTExpression,
     pub then: *mut ASTExpression,
-    pub otherwise: *mut ASTExpression;
+    pub otherwise: *mut ASTExpression,
+    pub chosen: *mut ASTExpression = null;
 
     ASTIfExpression(&mut this, condition: *mut ASTExpression, then: *mut ASTExpression, otherwise: *mut ASTExpression, span: SourceSpan) : ASTExpression(ASTExpressionKind::If, span) {
         (this.condition, this.then, this.otherwise) = (condition, then, otherwise);
@@ -251,6 +263,7 @@ class ASTConnection {
     pub name: String,
     pub value: *mut ASTExpression,
     pub span: SourceSpan,
+    pub text: String,
     pub port: *mut Symbol = null;
 
     ASTConnection(&mut this, name: &String, value: *mut ASTExpression, span: SourceSpan) {
@@ -260,6 +273,7 @@ class ASTConnection {
 
 class ASTInstanceExpression : ASTExpression {
     pub module: String,
+    pub parameters: Vector<*mut ASTConnection>,
     pub connections: Vector<*mut ASTConnection>,
     pub target: *mut Symbol = null;
 
@@ -269,7 +283,7 @@ class ASTInstanceExpression : ASTExpression {
 }
 
 enum ASTStatementKind: u8 {
-    Block, Assign, If, Match
+    Block, Assign, If, Match, For
 }
 
 class ASTStatement : ASTNode {
@@ -301,7 +315,9 @@ class ASTAssignStatement : ASTStatement {
 class ASTIfStatement : ASTStatement {
     pub condition: *mut ASTExpression,
     pub then: *mut ASTBlockStatement,
-    pub otherwise: *mut ASTStatement;
+    pub otherwise: *mut ASTStatement,
+    pub folded: bool = false,
+    pub chosen: *mut ASTStatement = null;
 
     ASTIfStatement(&mut this, condition: *mut ASTExpression, then: *mut ASTBlockStatement, otherwise: *mut ASTStatement, span: SourceSpan) : ASTStatement(ASTStatementKind::If, span) {
         (this.condition, this.then, this.otherwise) = (condition, then, otherwise);
@@ -329,8 +345,20 @@ class ASTMatchStatement : ASTStatement {
     }
 }
 
+class ASTForStatement : ASTStatement {
+    pub variable: String,
+    pub start: *mut ASTExpression,
+    pub end: *mut ASTExpression,
+    pub body: *mut ASTBlockStatement,
+    pub unrolled: *mut ASTBlockStatement = null;
+
+    ASTForStatement(&mut this, variable: &String, start: *mut ASTExpression, end: *mut ASTExpression, body: *mut ASTBlockStatement, span: SourceSpan) : ASTStatement(ASTStatementKind::For, span) {
+        (this.variable, this.start, this.end, this.body) = (variable, start, end, body);
+    }
+}
+
 enum ASTItemKind: u8 {
-    Const, Type, Enum, Module, Signal, Assign, Comb, Seq
+    Const, Type, Enum, Module, Signal, Assign, Comb, Seq, For, If
 }
 
 class ASTItem : ASTNode {
@@ -389,6 +417,8 @@ class ASTPort : ASTNode {
     pub registered: bool,
     pub declared: *mut ASTType,
     pub init: *mut ASTExpression,
+    pub bidirectional: bool = false,
+    pub condition: *mut ASTExpression = null,
     pub symbol: *mut Symbol = null;
 
     ASTPort(&mut this, name: &String, input: bool, registered: bool, declared: *mut ASTType, init: *mut ASTExpression, span: SourceSpan) : ASTNode(ASTNodeKind::Port, span) {
@@ -399,6 +429,7 @@ class ASTPort : ASTNode {
 class ASTModuleItem : ASTItem {
     pub name: String,
     pub external: bool,
+    pub parameters: Vector<String>,
     pub ports: Vector<*mut ASTPort>,
     pub items: Vector<*mut ASTItem>,
     pub info: *mut ModuleInfo = null;
@@ -450,6 +481,31 @@ class ASTSeqItem : ASTItem {
 
     ASTSeqItem(&mut this, clock: *mut ASTExpression, reset: *mut ASTExpression, body: *mut ASTBlockStatement, span: SourceSpan) : ASTItem(ASTItemKind::Seq, span) {
         (this.clock, this.reset, this.body) = (clock, reset, body);
+    }
+}
+
+class ASTForItem : ASTItem {
+    pub variable: String,
+    pub start: *mut ASTExpression,
+    pub end: *mut ASTExpression,
+    pub items: Vector<*mut ASTItem>,
+    pub expanded: Vector<*mut ASTItem>,
+    pub scopes: Vector<*mut Scope>;
+
+    ASTForItem(&mut this, variable: &String, start: *mut ASTExpression, end: *mut ASTExpression, span: SourceSpan) : ASTItem(ASTItemKind::For, span) {
+        (this.variable, this.start, this.end) = (variable, start, end);
+    }
+}
+
+class ASTIfItem : ASTItem {
+    pub condition: *mut ASTExpression,
+    pub then: Vector<*mut ASTItem>,
+    pub otherwise: Vector<*mut ASTItem>,
+    pub expanded: Vector<*mut ASTItem>,
+    pub scopes: Vector<*mut Scope>;
+
+    ASTIfItem(&mut this, condition: *mut ASTExpression, span: SourceSpan) : ASTItem(ASTItemKind::If, span) {
+        this.condition = condition;
     }
 }
 

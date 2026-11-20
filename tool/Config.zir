@@ -1,0 +1,225 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec" : *]
+
+class ConfigEntry {
+    pub section: String,
+    pub key: String,
+    pub values: Vector<String>;
+
+    ConfigEntry(&mut this) {}
+}
+
+fn StripComment(line: &String) -> String {
+    let mut quote = '\0';
+    let mut i: usize = 0;
+
+    while i < line.Length() {
+        let character = line[i];
+
+        if quote != '\0' {
+            if quote == '"' && character == '\\' {
+                i += 1;
+            } else if character == quote {
+                quote = '\0';
+            }
+        } else if character == '"' || character == '\'' {
+            quote = character;
+        } else if character == '#' {
+            return line.SubString(0, i);
+        }
+
+        i += 1;
+    }
+
+    String(line)
+}
+
+fn ArrayClosed(text: &String) -> bool {
+    let mut depth = 0i32;
+    let mut quote = '\0';
+    let mut i: usize = 0;
+
+    while i < text.Length() {
+        let character = text[i];
+
+        if quote != '\0' {
+            if quote == '"' && character == '\\' {
+                i += 1;
+            } else if character == quote {
+                quote = '\0';
+            }
+        } else if character == '"' || character == '\'' {
+            quote = character;
+        } else if character == '[' {
+            depth += 1;
+        } else if character == ']' {
+            depth -= 1;
+        }
+
+        i += 1;
+    }
+
+    depth <= 0
+}
+
+fn ParseItems(text: &String, values: &mut Vector<String>) -> bool {
+    let mut i: usize = 0;
+
+    while i < text.Length() {
+        let character = text[i];
+
+        if character == ' ' || character == '\t' || character == ',' || character == '[' || character == ']' {
+            i += 1;
+        } else if character == '"' || character == '\'' {
+            let mut item = String();
+            i += 1;
+
+            while i < text.Length() && text[i] != character {
+                if character == '"' && text[i] == '\\' && i + 1 < text.Length() {
+                    i += 1;
+                    let escaped = text[i];
+                    item += if escaped == 'n' { '\n' } else if escaped == 't' { '\t' } else { escaped };
+                } else {
+                    item += text[i];
+                }
+
+                i += 1;
+            }
+
+            if i >= text.Length() { return false; }
+            values.PushBack(item);
+            i += 1;
+        } else {
+            let start = i;
+
+            while i < text.Length() && text[i] != ',' && text[i] != ']' {
+                i += 1;
+            }
+
+            values.PushBack(text.SubString(start, i - start).Strip());
+        }
+    }
+
+    true
+}
+
+class Config {
+    pub entries: Vector<ConfigEntry>,
+    pub sections: Vector<String>,
+    pub error: String,
+    tables: Vector<String>;
+
+    Config(&mut this) {}
+
+    pub fn Parse(&mut this, text: &String) -> bool {
+        let lines = text.Replace("\r", "").Split('\n');
+        let mut section = String();
+        let mut i: usize = 0;
+
+        while i < lines.Length() {
+            let number = i + 1;
+            let line = StripComment(lines[i]).Strip();
+            i += 1;
+            if line.Empty() { continue; }
+
+            if line.StartsWith("[[") && line.EndsWith("]]") {
+                let name = line.SubString(2, line.Length() - 4).Strip();
+                let mut index: usize = 0;
+
+                for table in this.tables {
+                    if table == name { index += 1; }
+                }
+
+                this.tables.PushBack(name);
+                section = name + "." + String::FromInteger(index as u64);
+                this.sections.PushBack(section);
+                continue;
+            }
+
+            if line.StartsWith('[') && line.EndsWith(']') {
+                section = line.SubString(1, line.Length() - 2).Strip();
+                this.sections.PushBack(section);
+                continue;
+            }
+
+            let equals = match line.Find('=') {
+                Option<usize>::Some(index) => index,
+                Option<usize>::None => {
+                    this.error = "line " + String::FromInteger(number as u64) + ": expected 'key = value'";
+                    return false;
+                }
+            };
+
+            let mut value = line.SubString(equals + 1).Strip();
+
+            if value.StartsWith('[') {
+                while !ArrayClosed(value) && i < lines.Length() {
+                    value += " " + StripComment(lines[i]).Strip();
+                    i += 1;
+                }
+            }
+
+            let mut entry = ConfigEntry();
+            entry.section = section;
+            entry.key = line.SubString(0, equals).Strip();
+
+            if !ParseItems(value, entry.values) {
+                this.error = "line " + String::FromInteger(number as u64) + ": unterminated string";
+                return false;
+            }
+
+            this.entries.PushBack(entry);
+        }
+
+        true
+    }
+
+    pub fn List(&this, section: &String, key: *i8) -> Vector<String> {
+        for entry in this.entries {
+            if entry.section == section && entry.key == key { return entry.values; }
+        }
+
+        Vector<String>()
+    }
+
+    pub fn Get(&this, section: &String, key: *i8) -> String {
+        let values = this.List(section, key);
+        if values.Empty() { String() } else { String(values[0]) }
+    }
+
+    pub fn Keys(&this, section: &String) -> Vector<String> {
+        let mut keys = Vector<String>();
+
+        for entry in this.entries {
+            if entry.section == section { keys.PushBack(entry.key); }
+        }
+
+        keys
+    }
+
+    pub fn Tables(&this, name: *i8) -> Vector<String> {
+        let mut found = Vector<String>();
+        let prefix = name.ToString() + ".";
+
+        for section in this.sections {
+            if section.StartsWith(prefix) { found.PushBack(section); }
+        }
+
+        found
+    }
+}

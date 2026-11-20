@@ -1,0 +1,299 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "tool/System.zir", "tool/Project.zir" : *]
+
+fn Period(mhz: f64) -> String {
+    String::FromFloat(1000.0 / mhz, 3)
+}
+
+fn IsTopPort(project: &Project, name: &String) -> bool {
+    let text = ReadText(project.output);
+    let header = "module " + project.module + " (";
+
+    match text.Find(header) {
+        Option<usize>::Some(start) => {
+            let rest = text.SubString(start);
+            let end = match rest.Find(");") { Option<usize>::Some(index) => index, Option<usize>::None => rest.Length() };
+            let ports = rest.SubString(0, end);
+            ports.Contains(" " + name + ",") || ports.Contains(" " + name + "\n")
+        },
+        Option<usize>::None => false
+    }
+}
+
+fn TimingFile(project: &Project, folder: &String, netlist: &String) -> String {
+    if !project.timing.Empty() { return String(project.timing); }
+    if project.clocks.Empty() { return String(); }
+    let nets = ReadText(netlist);
+    let mut text = String();
+
+    for clock in project.clocks {
+        let buffered = clock.name + "_IBUF_I_O";
+        let mut target = "get_nets {" + clock.name + "}";
+
+        if IsTopPort(project, clock.name) {
+            target = if nets.Contains("\"" + buffered + "\"") { "get_nets {" + buffered + "}" } else { "get_ports {" + clock.name + "}" };
+        }
+
+        text += "create_clock -name " + clock.name + " -period " + Period(clock.mhz) + " [" + target + "]\n";
+    }
+
+    let path = Join(folder, "clocks.sdc".ToString());
+    if WriteText(path, text) { path } else { String() }
+}
+
+fn StripTags(text: &String) -> String {
+    let mut result = String();
+    let mut inside = false;
+
+    for i in 0..text.Length() {
+        let character = text[i];
+
+        if character == '<' {
+            inside = true;
+            result += ' ';
+        } else if character == '>' {
+            inside = false;
+        } else if !inside {
+            result += if character == '\n' || character == '\t' { ' ' } else { character };
+        }
+    }
+
+    result
+}
+
+fn Words(text: &String) -> Vector<String> {
+    let mut words = Vector<String>();
+
+    for word in text.Split(' ') {
+        if !word.Empty() { words.PushBack(word); }
+    }
+
+    words
+}
+
+fn ReportGowin(folder: &String, name: &String) {
+    let report = Join(folder, "impl/pnr/".ToString() + name + ".rpt.txt");
+    let wanted = ["Logic", "Register", "BSRAM", "DSP", "I/O Port"];
+
+    for line in Lines(report) {
+        let columns = line.Split('|');
+        if columns.Length() < 3 { continue; }
+        let label = columns[0].Strip();
+
+        for i in 0usize..5 {
+            if label == wanted[i] {
+                WriteLine("  " + label + " " * (10 - label.Length()) + columns[1].Strip() + "  " + columns[2].Strip());
+            }
+        }
+    }
+
+    let timing = ReadText(Join(folder, "impl/pnr/".ToString() + name + "_tr_content.html"));
+
+    if let Option<usize>::Some(start) = timing.Find("Max Frequency Summary") {
+        let end = match timing.SubString(start).Find("</table>") { Option<usize>::Some(index) => index, Option<usize>::None => 4000 };
+        let words = Words(StripTags(timing.SubString(start, end)));
+        let mut i: usize = 1;
+
+        while i + 1 < words.Length() {
+            if words[i].EndsWith("(MHz)") && words[i + 1].EndsWith("(MHz)") {
+                let constraint = words[i].SubString(0, words[i].Length() - 5);
+                let actual = words[i + 1].SubString(0, words[i + 1].Length() - 5);
+                WriteLine("  " + words[i - 1] + " " + actual + " MHz (target " + constraint + " MHz)");
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+fn BuildGowin(project: &Project) -> bool {
+    if project.tools.gowin.Empty() {
+        return Failed("cannot find Gowin's gw_sh.exe; set 'gowin' under [tools] or GOWIN_HOME");
+    }
+
+    if project.board.part.Empty() { return Failed("the board has no Gowin part name; set 'part' under [board]"); }
+    let folder = Join(project.build, "gowin".ToString());
+    MakeFolders(folder);
+    let mut script = "set_device " + project.board.device + " -name " + project.board.part + "\n";
+    script += "add_file \"" + project.output + "\"\n";
+
+    for file in project.Paths("project".ToString(), "files") {
+        script += "add_file \"" + file + "\"\n";
+    }
+
+    for file in project.Paths("gowin".ToString(), "files") {
+        script += "add_file \"" + file + "\"\n";
+    }
+
+    script += "add_file \"" + project.constraints + "\"\n";
+    let timing = TimingFile(project, folder, String());
+    if !timing.Empty() { script += "add_file \"" + timing + "\"\n"; }
+    script += "set_option -top_module " + project.module + " -verilog_std sysv2017 -output_base_name " + project.name;
+
+    for option in project.config.List("gowin".ToString(), "options") {
+        script += " " + option;
+    }
+
+    script += "\nrun all\n";
+    let tcl = Join(folder, "build.tcl".ToString());
+    if !WriteText(tcl, script) { return false; }
+    let log = Join(folder, "gw.log".ToString());
+    WriteLine("veles: synthesizing and routing with Gowin (" + project.tools.gowin + ")");
+    let previous = CurrentFolder();
+    EnterFolder(folder);
+    let code = Run(project.tools.gowin, Quote(tcl), log);
+    EnterFolder(previous);
+    let bitstream = Join(folder, "impl/pnr/".ToString() + project.name + ".fs");
+
+    if code != 0 || !FileExists(bitstream) {
+        ShowMatches(log, "ERROR", 10);
+
+        if ReadText(log).Contains("License verification failed") {
+            ShowMatches(log, "License", 2);
+            return Failed("Gowin could not read its license; check the .lic path in gwlicense.ini next to gw_sh.exe");
+        }
+
+        return Failed("Gowin failed, see " + project.Relative(log));
+    }
+
+    if !CopyFile(bitstream, project.Bitstream()) { return Failed("cannot copy the bitstream"); }
+    ReportGowin(folder, project.name);
+    WriteLine("veles: wrote " + project.Relative(project.Bitstream()));
+    true
+}
+
+fn ReportOpen(log: &String) {
+    let mut table = false;
+
+    for line in Lines(log) {
+        if line.Contains("Device utilisation") {
+            table = true;
+            continue;
+        }
+
+        if table {
+            let fields = Words(line.Replace("\t", " ").Replace("Info:", ""));
+
+            if fields.Length() >= 4 && fields[0].EndsWith(":") && fields[1].EndsWith("/") {
+                let used = fields[1].SubString(0, fields[1].Length() - 1);
+                let label = fields[0].SubString(0, fields[0].Length() - 1);
+
+                if !(used == "0") && !(label == "VCC") && !(label == "GND") && !(label == "GSR") {
+                    WriteLine("  " + label + " " * (if label.Length() < 16 { 16 - label.Length() } else { 1 }) + used + "/" + fields[2] + "  " + fields[3]);
+                }
+
+                continue;
+            }
+
+            table = false;
+        }
+    }
+
+    let mut clocks = Vector<String>();
+
+    for line in Lines(log) {
+        if line.Contains("Max frequency for clock") { clocks.PushBack(line.Replace("Info:", "").Strip()); }
+    }
+
+    let half = clocks.Length() / 2;
+
+    for i in half..clocks.Length() {
+        WriteLine("  " + clocks[i]);
+    }
+}
+
+fn BuildOpen(project: &Project) -> bool {
+    if !project.tools.HasOpen() {
+        return Failed("cannot find yosys, nextpnr-himbaechel and gowin_pack; install the OSS CAD Suite and set 'oss' under [tools] or OSS_CAD_SUITE");
+    }
+
+    if project.board.synthesis.Empty() { return Failed("the board has no synthesis family; set 'synthesis' under [board]"); }
+    let folder = Join(project.build, "open".ToString());
+    MakeFolders(folder);
+    let netlist = Join(folder, project.name + ".json");
+    let routed = Join(folder, project.name + ".routed.json");
+    let mut script = "read_verilog -sv \"" + project.output + "\"\n";
+
+    for file in project.Paths("project".ToString(), "files") {
+        script += "read_verilog -sv \"" + file + "\"\n";
+    }
+
+    for file in project.Paths("open".ToString(), "files") {
+        script += "read_verilog -sv \"" + file + "\"\n";
+    }
+
+    script += "synth_gowin -family " + project.board.synthesis + " -top " + project.module + " -json \"" + netlist + "\"\n";
+    let synthesis = Join(folder, "synth.ys".ToString());
+    if !WriteText(synthesis, script) { return false; }
+    let synthesis_log = Join(folder, "synth.log".ToString());
+    WriteLine("veles: synthesizing with yosys");
+
+    if Run(project.tools.yosys, "-q -l " + Quote(synthesis_log) + " " + Quote(synthesis), Join(folder, "yosys.txt".ToString())) != 0 {
+        ShowMatches(synthesis_log, "ERROR", 10);
+        return Failed("yosys failed, see " + project.Relative(synthesis_log));
+    }
+
+    let mut arguments = "--json " + Quote(netlist) + " --write " + Quote(routed) + " --device " + project.board.device +
+        " --vopt family=" + project.board.family + " --vopt " + Quote("cst=" + project.constraints) + " --timing-allow-fail";
+
+    let timing = TimingFile(project, folder, netlist);
+    if !timing.Empty() { arguments += " --sdc " + Quote(timing); }
+
+    for option in project.config.List("open".ToString(), "options") {
+        arguments += " " + option;
+    }
+
+    let route_log = Join(folder, "pnr.log".ToString());
+    arguments += " --log " + Quote(route_log);
+    WriteLine("veles: placing and routing with nextpnr");
+
+    if Run(project.tools.nextpnr, arguments, Join(folder, "nextpnr.txt".ToString())) != 0 {
+        ShowMatches(route_log, "ERROR", 10);
+        ReportOpen(route_log);
+        return Failed("nextpnr failed, see " + project.Relative(route_log));
+    }
+
+    let pack_log = Join(folder, "pack.txt".ToString());
+
+    if Run(project.tools.pack, "-d " + project.board.family + " -o " + Quote(project.Bitstream()) + " " + Quote(routed), pack_log) != 0 {
+        ShowTail(pack_log, 10);
+        return Failed("gowin_pack failed");
+    }
+
+    ReportOpen(route_log);
+    WriteLine("veles: wrote " + project.Relative(project.Bitstream()));
+    true
+}
+
+fn Build(project: &Project, requested: &String) -> bool {
+    let backend = if !requested.Empty() { String(requested) } else if !project.backend.Empty() { String(project.backend) }
+        else if !project.tools.gowin.Empty() { "gowin".ToString() } else { "open".ToString() };
+
+    if !(backend == "gowin") && !(backend == "open") {
+        return Failed("unknown backend '" + backend + "'; use gowin or open");
+    }
+
+    if !project.NeedsBoard() || !project.Compile() { return false; }
+    MakeFolders(project.build);
+    if backend == "gowin" { return BuildGowin(project); }
+    project.tools.UseSuite(true);
+    let built = BuildOpen(project);
+    project.tools.UseSuite(false);
+    built
+}

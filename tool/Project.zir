@@ -1,0 +1,243 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "tool/System.zir", "tool/Config.zir", "tool/Tools.zir" : *]
+
+const PROJECT_FILE: *i8 = "veles.toml";
+
+fn FindProject() -> String {
+    let mut folder = CurrentFolder();
+
+    while !folder.Empty() {
+        let candidate = Join(folder, PROJECT_FILE.ToString());
+        if FileExists(candidate) { return Slashes(candidate); }
+        let parent = Parent(folder);
+        if parent == folder { break; }
+        folder = parent;
+    }
+
+    String()
+}
+
+fn Failed(message: &String) -> bool {
+    WriteErrorLine("veles: " + message);
+    false
+}
+
+fn Failed(message: *i8) -> bool {
+    Failed(message.ToString())
+}
+
+class Clock {
+    pub name: String,
+    pub mhz: f64 = 0.0;
+
+    Clock(&mut this) {}
+}
+
+class FlashImage {
+    pub file: String,
+    pub address: String;
+
+    FlashImage(&mut this) {}
+}
+
+class Project {
+    pub root: String,
+    pub config: Config,
+    pub name: String,
+    pub top: String,
+    pub module: String,
+    pub output: String,
+    pub build: String,
+    pub constraints: String,
+    pub timing: String,
+    pub backend: String,
+    pub includes: Vector<String>,
+    pub clocks: Vector<Clock>,
+    pub images: Vector<FlashImage>,
+    pub board: Board,
+    pub tools: Tools;
+
+    Project(&mut this) {}
+
+    pub fn Path(&this, path: &String) -> String {
+        if path.Empty() { return String(); }
+        if IsAbsolute(path) { Slashes(path) } else { Slashes(Join(this.root, path)) }
+    }
+
+    pub fn Paths(&this, section: &String, key: *i8) -> Vector<String> {
+        let mut paths = Vector<String>();
+
+        for path in this.config.List(section, key) {
+            paths.PushBack(this.Path(path));
+        }
+
+        paths
+    }
+
+    pub fn Relative(&this, path: &String) -> String {
+        let prefix = this.root + "/";
+        if path.StartsWith(prefix) { path.SubString(prefix.Length()) } else { String(path) }
+    }
+
+    pub fn Load(&mut this, file: &String) -> bool {
+        let absolute = match AbsolutePath(file) {
+            Result<String, IOError>::Ok(path) => Slashes(path),
+            Result<String, IOError>::Err(_) => Slashes(file)
+        };
+
+        this.root = Parent(absolute);
+
+        if !this.config.Parse(ReadText(absolute)) {
+            return Failed(PROJECT_FILE.ToString() + ": " + this.config.error);
+        }
+
+        let project = "project".ToString();
+        let board = "board".ToString();
+        this.name = this.config.Get(project, "name");
+        if this.name.Empty() { this.name = FileName(this.root); }
+        let top = this.config.Get(project, "top");
+        this.top = this.Path(if top.Empty() { "src/Top.vel".ToString() } else { top });
+
+        if !FileExists(this.top) {
+            return Failed("cannot find the top file " + this.Relative(this.top) + "; set 'top' under [project]");
+        }
+
+        this.module = this.config.Get(project, "module");
+        if this.module.Empty() { this.module = Stem(this.top); }
+        let build = this.config.Get(project, "build");
+        this.build = this.Path(if build.Empty() { "build".ToString() } else { build });
+        let output = this.config.Get(project, "output");
+        this.output = if output.Empty() { Join(this.build, this.name + ".sv") } else { this.Path(output) };
+        this.includes = this.Paths(project, "include");
+        this.backend = this.config.Get(project, "backend");
+
+        let board_name = this.config.Get(board, "name");
+
+        if !board_name.Empty() {
+            match FindBoard(board_name) {
+                Option<Board>::Some(known) => { this.board = known; },
+                Option<Board>::None => {
+                    this.board.name = board_name;
+                }
+            }
+        }
+
+        let device = this.config.Get(board, "device");
+        if !device.Empty() { this.board.device = device; }
+        let part = this.config.Get(board, "part");
+        if !part.Empty() { this.board.part = part; }
+        let family = this.config.Get(board, "family");
+        if !family.Empty() { this.board.family = family; }
+        let synthesis = this.config.Get(board, "synthesis");
+        if !synthesis.Empty() { this.board.synthesis = synthesis; }
+        let loader = this.config.Get(board, "loader");
+        if !loader.Empty() { this.board.loader = loader; }
+        let cable = this.config.Get(board, "cable");
+        if !cable.Empty() { this.board.cable = cable; }
+        let flash_operation = this.config.Get(board, "flash_operation");
+        if !flash_operation.Empty() { this.board.flash_operation = flash_operation; }
+        let image_operation = this.config.Get(board, "image_operation");
+        if !image_operation.Empty() { this.board.image_operation = image_operation; }
+        let frequency = this.config.Get(board, "frequency");
+        if !frequency.Empty() { this.board.frequency = frequency; }
+        this.constraints = this.Path(this.config.Get(board, "constraints"));
+        this.timing = this.Path(this.config.Get(board, "timing"));
+
+        let clocks = "clocks".ToString();
+
+        for key in this.config.Keys(clocks) {
+            let mut clock = Clock();
+            clock.name = key;
+
+            match this.config.Get(clocks, key.Data()).ToFloat() {
+                Option<f64>::Some(mhz) => { clock.mhz = mhz; },
+                Option<f64>::None => {
+                    return Failed("the frequency of clock '" + key + "' is not a number");
+                }
+            }
+
+            this.clocks.PushBack(clock);
+        }
+
+        for section in this.config.Tables("flash") {
+            let mut image = FlashImage();
+            image.file = this.Path(this.config.Get(section, "file"));
+            image.address = this.config.Get(section, "address");
+            if image.file.Empty() || image.address.Empty() { return Failed("every [[flash]] entry needs 'file' and 'address'"); }
+            this.images.PushBack(image);
+        }
+
+        this.tools.Find(this.config);
+        true
+    }
+
+    pub fn NeedsBoard(&this) -> bool {
+        if this.board.device.Empty() || this.board.family.Empty() {
+            return Failed("no board is set; add [board] with name = \"" + BoardNames() + "\" or give device, part, family and synthesis");
+        }
+
+        if this.constraints.Empty() || !FileExists(this.constraints) {
+            return Failed("cannot find the constraints file; set 'constraints' under [board]");
+        }
+
+        true
+    }
+
+    pub fn Prepare(&this) -> bool {
+        for command in this.config.List("project".ToString(), "before") {
+            WriteLine("veles: running " + command);
+            let previous = CurrentFolder();
+            EnterFolder(this.root);
+            let line = Quote(command);
+            let code = system(line.Data());
+            EnterFolder(previous);
+            if code != 0 { return Failed("'" + command + "' failed"); }
+        }
+
+        true
+    }
+
+    pub fn Compile(&this) -> bool {
+        if this.tools.velesc.Empty() { return Failed("cannot find velesc.exe next to veles.exe or in PATH"); }
+        if !this.Prepare() { return false; }
+        MakeFolders(Parent(this.output));
+        let mut arguments = Quote(this.top) + " -o " + Quote(this.output);
+
+        for include in this.includes {
+            arguments += " -I" + Quote(include);
+        }
+
+        WriteLine("veles: compiling " + this.Relative(this.top));
+        Run(this.tools.velesc, arguments, String()) == 0
+    }
+
+    pub fn Check(&this) -> bool {
+        if this.tools.velesc.Empty() { return Failed("cannot find velesc.exe next to veles.exe or in PATH"); }
+        let mut arguments = Quote(this.top) + " -fsyntax-only";
+
+        for include in this.includes {
+            arguments += " -I" + Quote(include);
+        }
+
+        Run(this.tools.velesc, arguments, String()) == 0
+    }
+
+    pub fn Bitstream(&this) -> String {
+        Join(this.build, this.name + ".fs")
+    }
+}

@@ -1,0 +1,114 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "tool/System.zir", "tool/Project.zir" : *]
+
+fn Number(value: usize) -> String {
+    String::FromInteger(value as u64)
+}
+
+fn ConstraintsText(board: &Board) -> String {
+    let mut text = "IO_LOC \"clk\" " + board.clock_pin + ";\nIO_PORT \"clk\" IO_TYPE=LVCMOS33 PULL_MODE=NONE;\n";
+
+    for i in 0..board.led_pins.Length() {
+        let name = "leds[" + Number(i) + "]";
+        text += "\nIO_LOC \"" + name + "\" " + board.led_pins[i] + ";\n";
+        text += "IO_PORT \"" + name + "\" IO_TYPE=" + board.led_type + " PULL_MODE=NONE;\n";
+    }
+
+    text
+}
+
+fn TopText(leds: usize) -> String {
+    "module Top(clk: in clock, leds: out u" + Number(leds) + ") {\n" +
+    "    reg count: u26 = 0;\n\n" +
+    "    seq(clk) {\n" +
+    "        count <- count + 1;\n" +
+    "    }\n\n" +
+    "    leds = !count[25:" + Number(26 - leds) + "];\n" +
+    "}\n"
+}
+
+fn BenchText(leds: usize) -> String {
+    let high = Number(leds - 1);
+    let low = Number(26 - leds);
+    "`timescale 1ns / 1ps\n\n".ToString() +
+    "module TopTB;\n" +
+    "    logic clk = 0;\n" +
+    "    logic [" + high + ":0] leds;\n\n" +
+    "    Top dut (.clk(clk), .leds(leds));\n\n" +
+    "    always #18.5 clk = ~clk;\n\n" +
+    "    initial begin\n" +
+    "        repeat (100) @(posedge clk);\n" +
+    "        #1;\n\n" +
+    "        if (dut.count == 26'd100 && leds == ~dut.count[25:" + low + "])\n" +
+    "            $display(\"PASS\");\n" +
+    "        else\n" +
+    "            $display(\"FAIL count=%0d leds=%b\", dut.count, leds);\n\n" +
+    "        $finish;\n" +
+    "    end\n" +
+    "endmodule\n"
+}
+
+fn ProjectText(name: &String, board: &Board) -> String {
+    "[project]\n".ToString() +
+    "name = \"" + name + "\"\n" +
+    "top = \"src/Top.vel\"\n\n" +
+    "[board]\n" +
+    "name = \"" + board.name + "\"\n" +
+    "constraints = \"" + board.name + ".cst\"\n\n" +
+    "[clocks]\n" +
+    "clk = " + board.clock_mhz + "\n\n" +
+    "[[test]]\n" +
+    "name = \"Top\"\n" +
+    "bench = [\"test/TopTB.sv\"]\n"
+}
+
+fn NewProject(name: &String, board_name: &String) -> bool {
+    if name.Empty() { return Failed("give the project a name: veles new <name>"); }
+
+    let board = match FindBoard(board_name) {
+        Option<Board>::Some(board) => board,
+        Option<Board>::None => {
+            return Failed("unknown board '" + board_name + "'; known boards: " + BoardNames());
+        }
+    };
+
+    let root = Join(CurrentFolder(), name);
+
+    if PathExists(root) {
+        return Failed("'" + name + "' already exists");
+    }
+
+    if !MakeFolders(Join(root, "src".ToString())) || !MakeFolders(Join(root, "test".ToString())) {
+        return Failed("cannot create '" + name + "'");
+    }
+
+    let leds = board.led_pins.Length();
+    let written = WriteText(Join(root, PROJECT_FILE.ToString()), ProjectText(name, board)) &&
+        WriteText(Join(root, board.name + ".cst"), ConstraintsText(board)) &&
+        WriteText(Join(root, "src/Top.vel".ToString()), TopText(leds)) &&
+        WriteText(Join(root, "test/TopTB.sv".ToString()), BenchText(leds)) &&
+        WriteText(Join(root, ".gitignore".ToString()), "build/\n".ToString());
+
+    if !written { return false; }
+    WriteLine("veles: created " + name + " for " + board.name);
+    WriteLine("  cd " + name);
+    WriteLine("  veles test");
+    WriteLine("  veles build");
+    WriteLine("  veles upload");
+    true
+}

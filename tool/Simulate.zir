@@ -1,0 +1,269 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "tool/System.zir", "tool/Project.zir" : *]
+
+class Test {
+    pub name: String,
+    pub top: String,
+    pub expect: String,
+    pub wave: String,
+    pub wave_from: String,
+    pub simulator: String,
+    pub bench: Vector<String>,
+    pub library: Vector<String>,
+    pub args: Vector<String>,
+    pub after: Vector<String>;
+
+    Test(&mut this) {}
+}
+
+fn Tests(project: &Project) -> Vector<Test> {
+    let mut tests = Vector<Test>();
+    let common = "tests".ToString();
+
+    for section in project.config.Tables("test") {
+        let mut test = Test();
+        let own = project.Paths(section, "bench");
+        test.bench = project.Paths(common, "bench");
+        let stem = if !own.Empty() { Stem(own[0]) } else if !test.bench.Empty() { Stem(test.bench[0]) } else { String() };
+        for path in own { test.bench.PushBack(path); }
+        test.library = project.Paths(common, "library");
+        for path in project.Paths(section, "library") { test.library.PushBack(path); }
+        test.name = project.config.Get(section, "name");
+        if test.name.Empty() { test.name = String(stem); }
+        test.top = project.config.Get(section, "top");
+        if test.top.Empty() { test.top = project.config.Get(common, "top"); }
+        if test.top.Empty() { test.top = String(stem); }
+        test.expect = project.config.Get(section, "expect");
+        if test.expect.Empty() { test.expect = "PASS".ToString(); }
+        test.args = project.config.List(common, "args");
+        for argument in project.config.List(section, "args") { test.args.PushBack(argument); }
+        test.after = project.config.List(section, "after");
+        test.wave = project.config.Get(section, "wave");
+        if test.wave.Empty() { test.wave = String(test.top); }
+        test.wave_from = project.config.Get(section, "wave_from_us");
+        test.simulator = project.config.Get(section, "simulator");
+        if test.simulator.Empty() { test.simulator = project.config.Get(common, "simulator"); }
+        if test.simulator.Empty() { test.simulator = project.config.Get("project".ToString(), "simulator"); }
+        if test.simulator.Empty() { test.simulator = "iverilog".ToString(); }
+        tests.PushBack(test);
+    }
+
+    tests
+}
+
+const NOT_BUILT: i32 = -1000;
+
+fn WaveFile(project: &Project, test: &Test) -> String {
+    Join(Join(project.build, "sim".ToString()), test.name + (if test.simulator == "verilator" { ".vcd" } else { ".fst" }))
+}
+
+fn DumpText(test: &Test, wave_file: &String, scope: &String) -> String {
+    let mut text = "        $dumpfile(\"" + wave_file + "\");\n        $dumpvars(0, " + scope + ");\n";
+
+    if !test.wave_from.Empty() {
+        text += "        $dumpoff;\n        #(" + test.wave_from + " * 1000.0);\n        $dumpon;\n";
+    }
+
+    text
+}
+
+fn Arguments(test: &Test) -> String {
+    let mut arguments = String();
+
+    for argument in test.args {
+        arguments += " " + Quote(argument);
+    }
+
+    arguments
+}
+
+fn RunProgram(project: &Project, program: &String, arguments: &String, log: &String) -> i32 {
+    let previous = CurrentFolder();
+    EnterFolder(project.root);
+    let code = Run(program, arguments, log);
+    EnterFolder(previous);
+    code
+}
+
+fn RunIcarus(project: &Project, test: &Test, wave: bool, files: &String, folder: &String, wave_file: &String, log: &String) -> i32 {
+    if project.tools.iverilog.Empty() || project.tools.vvp.Empty() {
+        Failed("cannot find iverilog and vvp; install the OSS CAD Suite or Icarus Verilog");
+        return NOT_BUILT;
+    }
+
+    let mut sources = String(files);
+    let mut roots = " -s " + test.top;
+
+    if wave {
+        let path = Join(folder, "VelesWave.sv".ToString());
+        let module = "`timescale 1ns / 1ps\n\nmodule VelesWave;\n    initial begin\n" + DumpText(test, wave_file, test.wave) + "    end\nendmodule\n";
+        if !WriteText(path, module) { return NOT_BUILT; }
+        sources += " " + Quote(path);
+        roots += " -s VelesWave";
+    }
+
+    let image = Join(folder, test.name + ".vvp");
+    let compile_log = Join(folder, test.name + ".compile.log");
+
+    if Run(project.tools.iverilog, "-g2012" + roots + " -o " + Quote(image) + " " + sources, compile_log) != 0 {
+        WriteLine("FAIL " + test.name + " (does not compile)");
+        ShowTail(compile_log, 12);
+        return NOT_BUILT;
+    }
+
+    RunProgram(project, project.tools.vvp, "-n " + Quote(image) + (if wave { " -fst" } else { "" }) + Arguments(test), log)
+}
+
+fn RunVerilator(project: &Project, test: &Test, wave: bool, files: &String, folder: &String, wave_file: &String, log: &String) -> i32 {
+    if !project.tools.HasVerilator() {
+        Failed("cannot find Verilator (verilator_bin.exe in the OSS CAD Suite) and the MSYS2 UCRT64 C++ tools (g++, mingw32-make and sh in C:/msys64)");
+        return NOT_BUILT;
+    }
+
+    let mut sources = String(files);
+    let mut top = String(test.top);
+    let mut options = String();
+
+    if wave {
+        let scope = if test.wave == test.top { "test".ToString() } else if test.wave.StartsWith(test.top + ".") { "test" + test.wave.SubString(test.top.Length()) } else { String(test.wave) };
+        let path = Join(folder, test.name + ".top.sv");
+        let module = "`timescale 1ns / 1ps\n\nmodule VelesTop;\n    " + test.top + " test();\n\n    initial begin\n" + DumpText(test, wave_file, scope) + "    end\nendmodule\n";
+        if !WriteText(path, module) { return NOT_BUILT; }
+        sources += " " + Quote(path);
+        top = "VelesTop".ToString();
+        options = " --trace".ToString();
+    }
+
+    let model = Join(folder, test.name + (if wave { ".wave" } else { ".model" }));
+    let build_log = Join(folder, test.name + ".build.log");
+    WriteLine("veles: building " + test.name + " with Verilator");
+    project.tools.UseVerilator(true);
+    let built = Run(project.tools.verilator, "--binary --timing -j 0 -Wno-fatal -Wno-lint -Wno-style -Wno-MODDUP --x-initial 0 --x-assign 0 -CFLAGS -std=gnu++17 -MAKEFLAGS OPT_FAST=-O3 -MAKEFLAGS OPT_GLOBAL=-O2" + options +
+        " --top-module " + top + " --Mdir " + Quote(model) + " -o " + test.name + ".exe " + sources, build_log);
+
+    if built != 0 {
+        project.tools.UseVerilator(false);
+        WriteLine("FAIL " + test.name + " (does not build)");
+        ShowMatches(build_log, "%Error", 10);
+        ShowTail(build_log, 6);
+        return NOT_BUILT;
+    }
+
+    let code = RunProgram(project, Join(model, test.name + ".exe"), Arguments(test), log);
+    project.tools.UseVerilator(false);
+    code
+}
+
+fn Simulation(project: &Project, test: &Test, wave: bool) -> bool {
+    if test.bench.Empty() { return Failed("test '" + test.name + "' has no 'bench' files"); }
+
+    if !(test.simulator == "iverilog") && !(test.simulator == "verilator") {
+        return Failed("test '" + test.name + "' asks for the unknown simulator '" + test.simulator + "'; use iverilog or verilator");
+    }
+
+    let folder = Join(project.build, "sim".ToString());
+    MakeFolders(folder);
+    let mut files = String();
+
+    for file in test.library {
+        files += (if test.simulator == "verilator" { "-v " } else { "-l " }) + Quote(file) + " ";
+    }
+
+    files += Quote(project.output);
+
+    for file in test.bench {
+        files += " " + Quote(file);
+    }
+
+    let wave_file = WaveFile(project, test);
+    let log = Join(folder, test.name + ".log");
+    let code = if test.simulator == "verilator" { RunVerilator(project, test, wave, files, folder, wave_file, log) } else { RunIcarus(project, test, wave, files, folder, wave_file, log) };
+    if code == NOT_BUILT { return false; }
+
+    if code != 0 || !ReadText(log).Contains(test.expect) {
+        WriteLine("FAIL " + test.name + (if code != 0 { " (exit code " + String::FromInteger(code as i64) + ")" } else { " ('" + test.expect + "' was not printed)" }));
+        ShowTail(log, 12);
+        return false;
+    }
+
+    for command in test.after {
+        let previous_folder = CurrentFolder();
+        EnterFolder(project.root);
+        let line = Quote(command + " >> " + Quote(Native(log)) + " 2>&1");
+        let result = system(line.Data());
+        EnterFolder(previous_folder);
+
+        if result != 0 {
+            WriteLine("FAIL " + test.name + " ('" + command + "' exited with " + String::FromInteger(result as i64) + ")");
+            ShowTail(log, 12);
+            return false;
+        }
+    }
+
+    WriteLine("PASS " + test.name);
+    if wave { WriteLine("veles: wrote " + project.Relative(wave_file)); }
+    true
+}
+
+fn RunTests(project: &Project, names: &Vector<String>) -> bool {
+    let tests = Tests(project);
+    if tests.Empty() { return Failed("there are no tests; add [[test]] sections to ".ToString() + PROJECT_FILE); }
+    if !project.Compile() { return false; }
+    let (mut passed, mut failed): (usize, usize) = (0, 0);
+    project.tools.UseSuite(true);
+
+    for test in tests {
+        if !names.Empty() && !names.Contains(test.name) { continue; }
+        if Simulation(project, test, false) { passed += 1; } else { failed += 1; }
+    }
+
+    project.tools.UseSuite(false);
+
+    if passed + failed == 0 { return Failed("no test matches the given names"); }
+    WriteLine("veles: " + String::FromInteger(passed as u64) + " passed, " + String::FromInteger(failed as u64) + " failed");
+    failed == 0
+}
+
+fn Simulate(project: &Project, name: &String, open: bool) -> bool {
+    let tests = Tests(project);
+    if tests.Empty() { return Failed("there are no tests; add [[test]] sections to ".ToString() + PROJECT_FILE); }
+
+    for test in tests {
+        if !name.Empty() && !(test.name == name) { continue; }
+        if !project.Compile() { return false; }
+        project.tools.UseSuite(true);
+        let simulated = Simulation(project, test, true);
+
+        if simulated && open {
+            let wave_file = Quote(WaveFile(project, test));
+
+            if !project.tools.surfer.Empty() {
+                Launch(project.tools.surfer, wave_file);
+            } else if !project.tools.gtkwave.Empty() {
+                Launch(project.tools.gtkwave, wave_file);
+            } else {
+                WriteLine("veles: neither Surfer nor GTKWave was found, open the file with a waveform viewer");
+            }
+        }
+
+        project.tools.UseSuite(false);
+        return simulated;
+    }
+
+    Failed("there is no test named '" + name + "'")
+}

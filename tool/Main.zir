@@ -1,0 +1,226 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/io", "std/str", "std/vec", "std/file", "tool/System.zir", "tool/Config.zir", "tool/Tools.zir", "tool/Project.zir",
+    "tool/Build.zir", "tool/Simulate.zir", "tool/New.zir" : *]
+
+fn PrintUsage() {
+    WriteLine("OVERVIEW: Veles project tool");
+    WriteLine("USAGE: veles <command> [options]");
+    WriteLine("COMMANDS:");
+    WriteLine("  new <name> [--board <board>]   Create a project (boards: " + BoardNames() + ")");
+    WriteLine("  build [--backend gowin|open]   Compile, synthesize, place and route, and write the bitstream");
+    WriteLine("  check                          Check the Veles sources without writing output");
+    WriteLine("  test [name...]                 Run the tests listed in veles.toml");
+    WriteLine("  simulate [name] [--no-open]    Run a test with a waveform and open it in Surfer or GTKWave");
+    WriteLine("  upload [--flash | --images] [--backend gowin|open]");
+    WriteLine("                                 Write the bitstream to the FPGA, or the bitstream and the [[flash]] files to");
+    WriteLine("                                 the flash, or only the [[flash]] files, with Gowin's programmer or openFPGALoader");
+    WriteLine("  tools                          Show which tools were found");
+    WriteLine("  clean                          Delete the build folder");
+}
+
+fn RunProgrammer(project: &Project, operation: &String, files: &String) -> bool {
+    let cable = if project.board.cable.Empty() { "1".ToString() } else { String(project.board.cable) };
+    let speed = if project.board.frequency.Empty() { String() } else { " --frequency " + project.board.frequency + "MHz" };
+    let encoding = Environment("PYTHONIOENCODING");
+    SetEnvironment("PYTHONIOENCODING", "utf-8".ToString());
+    let code = Run(project.tools.programmer, "--device " + project.board.part + " --cable-index " + cable + speed + " --run " + operation + files, String());
+    SetEnvironment("PYTHONIOENCODING", encoding);
+    code == 0
+}
+
+fn UploadGowin(project: &Project, flash: bool, images: bool, bitstream: &String) -> bool {
+    if project.tools.programmer.Empty() { return Failed("cannot find Gowin's programmer_cli.exe; set 'programmer' under [tools]"); }
+    if project.board.part.Empty() { return Failed("the board has no Gowin part; set 'part' under [board]"); }
+    if flash && !images && project.board.flash_operation.Empty() { return Failed("the board has no Gowin flash operation; set 'flash_operation' under [board]"); }
+    if (flash || images) && !project.images.Empty() && project.board.image_operation.Empty() { return Failed("the board has no Gowin operation for flash files; set 'image_operation' under [board]"); }
+
+    if !images {
+        WriteLine("veles: writing " + project.Relative(bitstream) + " to the " + (if flash { "flash" } else { "FPGA" }) + " with Gowin's programmer");
+        let operation = if flash { String(project.board.flash_operation) } else { "2".ToString() };
+        if !RunProgrammer(project, operation, " --fsFile " + Quote(Native(bitstream))) { return false; }
+        if !flash { return true; }
+    }
+
+    for image in project.images {
+        WriteLine("veles: writing " + project.Relative(image.file) + " to the flash at " + image.address + " with Gowin's programmer");
+        if !RunProgrammer(project, project.board.image_operation, " --mcuFile " + Quote(Native(image.file)) + " --spiaddr " + image.address) { return false; }
+    }
+
+    true
+}
+
+fn UploadOpen(project: &Project, flash: bool, images: bool, bitstream: &String) -> bool {
+    if project.tools.loader.Empty() { return Failed("cannot find openFPGALoader; install the OSS CAD Suite"); }
+    if project.board.loader.Empty() { return Failed("the board has no openFPGALoader name; set 'loader' under [board]"); }
+    let options = "-b " + project.board.loader + (if project.board.frequency.Empty() { String() } else { " --freq " + project.board.frequency + "M" });
+    project.tools.UseSuite(true);
+    let mut written = true;
+
+    if !images {
+        WriteLine("veles: writing " + project.Relative(bitstream) + " to the " + (if flash { "flash" } else { "FPGA" }) + " with openFPGALoader");
+        written = Run(project.tools.loader, options + (if flash { " -f" } else { "" }) + " " + Quote(bitstream), String()) == 0;
+    }
+
+    if written && (flash || images) {
+        for image in project.images {
+            WriteLine("veles: writing " + project.Relative(image.file) + " to the flash at " + image.address + " with openFPGALoader");
+            written = Run(project.tools.loader, options + " -f -o " + image.address + " " + Quote(image.file), String()) == 0;
+            if !written { break; }
+        }
+    }
+
+    project.tools.UseSuite(false);
+    written
+}
+
+fn Upload(project: &Project, flash: bool, images: bool, requested: &String) -> bool {
+    let backend = if !requested.Empty() { String(requested) } else if !project.backend.Empty() { String(project.backend) }
+        else if !project.tools.programmer.Empty() { "gowin".ToString() } else { "open".ToString() };
+
+    if !(backend == "gowin") && !(backend == "open") {
+        return Failed("unknown backend '" + backend + "'; use gowin or open");
+    }
+
+    if images && project.images.Empty() { return Failed("there are no [[flash]] files in ".ToString() + PROJECT_FILE); }
+
+    for image in project.images {
+        if (flash || images) && !FileExists(image.file) { return Failed("cannot find " + project.Relative(image.file)); }
+    }
+
+    let bitstream = project.Bitstream();
+    if !images && !FileExists(bitstream) { return Failed("there is no bitstream; run 'veles build' first"); }
+    if backend == "gowin" { UploadGowin(project, flash, images, bitstream) } else { UploadOpen(project, flash, images, bitstream) }
+}
+
+fn Status(success: bool) -> i32 {
+    if success { 0 } else { 1 }
+}
+
+fn Main(args: &mut Vector<String>) -> i32 {
+    if args.Length() < 2 {
+        PrintUsage();
+        return 1;
+    }
+
+    let command = args[1];
+
+    if command == "help" || command == "--help" || command == "-h" {
+        PrintUsage();
+        return 0;
+    }
+
+    if command == "--version" {
+        WriteLine("Veles project tool 0.1.0");
+        return 0;
+    }
+
+    if command == "new" {
+        let mut name = String();
+        let mut board = "tangnano20k".ToString();
+        let mut i: usize = 2;
+
+        while i < args.Length() {
+            if args[i] == "--board" && i + 1 < args.Length() {
+                board = args[i + 1];
+                i += 1;
+            } else if args[i].StartsWith('-') {
+                return Status(Failed("unknown option '" + args[i] + "'"));
+            } else {
+                name = args[i];
+            }
+
+            i += 1;
+        }
+
+        return Status(NewProject(name, board));
+    }
+
+    let mut project = Project();
+
+    if command == "tools" {
+        let path = FindProject();
+        if path.Empty() { project.tools.Find(project.config); } else if !project.Load(path) { return 1; }
+        project.tools.Show();
+        return 0;
+    }
+
+    let path = FindProject();
+
+    if path.Empty() {
+        return Status(Failed("cannot find ".ToString() + PROJECT_FILE + " here or in a parent folder; create a project with 'veles new <name>'"));
+    }
+
+    if !project.Load(path) { return 1; }
+
+    if command == "build" {
+        let mut backend = String();
+
+        for i in 2..args.Length() {
+            if args[i].StartsWith("--backend=") { backend = args[i].SubString(10); }
+            if args[i] == "--backend" && i + 1 < args.Length() { backend = args[i + 1]; }
+        }
+
+        return Status(Build(project, backend));
+    }
+
+    if command == "check" {
+        return Status(project.Check());
+    }
+
+    if command == "test" {
+        let mut names = Vector<String>();
+
+        for i in 2..args.Length() {
+            names.PushBack(args[i]);
+        }
+
+        return Status(RunTests(project, names));
+    }
+
+    if command == "simulate" {
+        let mut name = String();
+        let mut open = true;
+
+        for i in 2..args.Length() {
+            if args[i] == "--no-open" { open = false; } else { name = args[i]; }
+        }
+
+        return Status(Simulate(project, name, open));
+    }
+
+    if command == "upload" {
+        let mut flash = false;
+        let mut images = false;
+        let mut backend = String();
+
+        for i in 2..args.Length() {
+            if args[i] == "--flash" || args[i] == "-f" { flash = true; }
+            if args[i] == "--images" { images = true; }
+            if args[i].StartsWith("--backend=") { backend = args[i].SubString(10); }
+            if args[i] == "--backend" && i + 1 < args.Length() { backend = args[i + 1]; }
+        }
+
+        return Status(Upload(project, flash, images, backend));
+    }
+
+    if command == "clean" {
+        return Status(RemoveTree(project.build) || Failed("cannot delete " + project.Relative(project.build)));
+    }
+
+    Status(Failed("unknown command '" + command + "'; run 'veles help'"))
+}
